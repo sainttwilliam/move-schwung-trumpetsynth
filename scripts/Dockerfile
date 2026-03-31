@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
         make \
         file \
         python3 \
+        python-is-python3 \
         curl \
         bzip2 \
     && rm -rf /var/lib/apt/lists/*
@@ -30,6 +31,7 @@ RUN apt-get update && apt-get install -y \
 #                  ooura FFT is sufficient for YIN pitch detection
 # ---------------------------------------------------------------------------
 RUN curl -fsSL https://aubio.org/pub/aubio-0.4.9.tar.bz2 | tar -xj -C /tmp \
+    && find /tmp/aubio-0.4.9/waflib -name '*.py' -exec sed -i "s/'rU'/'r'/g" {} \; \
     && cd /tmp/aubio-0.4.9 \
     && CC=aarch64-linux-gnu-gcc \
        AR=aarch64-linux-gnu-ar \
@@ -43,7 +45,7 @@ RUN curl -fsSL https://aubio.org/pub/aubio-0.4.9.tar.bz2 | tar -xj -C /tmp \
            --disable-avcodec \
            --disable-wavread \
            --disable-wavwrite \
-    && python3 waf build \
+    && python3 waf build || test -f build/src/libaubio.a \
     && install -m 644 build/src/libaubio.a /usr/local/lib/libaubio-aarch64.a \
     && mkdir -p /usr/local/include/aubio \
     && cp -r src/* /usr/local/include/aubio/ \

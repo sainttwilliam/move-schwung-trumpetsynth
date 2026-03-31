@@ -61,7 +61,7 @@ scp -p "${DIST_DIR}/module.json"  "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}
 scp -p "${DIST_DIR}/ui.js"        "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
 scp -p "${DIST_DIR}/ui_chain.js"  "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
 scp -p "${DIST_DIR}/help.json"    "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
-scp -p "${DIST_DIR}/dsp.so"       "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
+scp -p "${DIST_DIR}/trumpet-synth.so" "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
 
 echo "Setting permissions..."
 ssh "${MOVE_USER}@${MOVE_HOST}" \

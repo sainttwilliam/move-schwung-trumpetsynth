@@ -25,8 +25,9 @@
 /* TODO: include aubio header once aubio is available on the target */
 /* #include <aubio/aubio.h> */
 
-/* Host API header provided by the Schwung build environment */
+/* Host API headers provided by the Schwung build environment */
 #include "host/plugin_api_v1.h"
+#include "host/audio_fx_api_v2.h"
 
 #define SAMPLE_RATE  44100.0f
 #define BLOCK_SIZE   128
@@ -388,16 +389,11 @@ static inline float capacitor_tick(TrumpetSynth *s, float in, int ch) {
 }
 
 /* -------------------------------------------------------------------------
- * Render block
+ * Process block (in-place: audio_fx_api_v2_t convention)
  * ---------------------------------------------------------------------- */
-static void plugin_render_block(void *instance, int16_t *out_lr, int frames) {
+static void plugin_process_block(void *instance, int16_t *audio_inout, int frames) {
     TrumpetSynth *s = (TrumpetSynth *)instance;
     Params       *p = &s->p;
-
-    /* Audio input buffer from host shared memory (stereo interleaved int16) */
-    const int16_t *audio_in = NULL;
-    if (g_host && g_host->mapped_memory)
-        audio_in = (const int16_t *)(g_host->mapped_memory + g_host->audio_in_offset);
 
     /* Compressor time constants — 1 ms attack, 100 ms release.
      * These are constant expressions; -O3 evaluates them at compile time. */
@@ -410,9 +406,7 @@ static void plugin_render_block(void *instance, int16_t *out_lr, int frames) {
      * compressor-conditioned mono signal into the aubio pitch buffer:
      *
      *   for (int i = 0; i < frames; i++) {
-     *       float raw   = audio_in
-     *                   ? (audio_in[i * 2] * p->input_gain / 32768.0f)
-     *                   : 0.0f;
+     *       float raw   = audio_inout[i * 2] * p->input_gain / 32768.0f;
      *       float cond  = compress_sample(&s->comp_env,
      *                                     hard_limit(raw),
      *                                     p->comp_threshold, p->comp_ratio,
@@ -431,9 +425,19 @@ static void plugin_render_block(void *instance, int16_t *out_lr, int frames) {
      *   }
      * ------------------------------------------------------------------- */
 
+    /* Advance compressor envelope using the incoming audio (keeps comp_env
+     * decay running correctly until aubio is wired in). */
+    for (int i = 0; i < frames; i++) {
+        float raw = audio_inout[i * 2] * p->input_gain / 32768.0f;
+        compress_sample(&s->comp_env, hard_limit(raw),
+                        p->comp_threshold, p->comp_ratio, p->comp_makeup,
+                        comp_atk, comp_rel);
+    }
+
     /* Pitch smoother coefficient */
     const float smooth_coef = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->pitch_smooth, 1e-4f)));
 
+    /* Synthesise and write back into audio_inout (replaces input signal) */
     for (int i = 0; i < frames; i++) {
         /* Smooth detected pitch toward target */
         s->smoothed_hz += smooth_coef * (s->detected_hz - s->smoothed_hz);
@@ -451,20 +455,8 @@ static void plugin_render_block(void *instance, int16_t *out_lr, int frames) {
         float out_l = capacitor_tick(s, osc * env, 0);
         float out_r = capacitor_tick(s, osc * env, 1);
 
-        /* Output */
-        out_lr[i * 2 + 0] = (int16_t)(out_l * p->volume * 32767.0f);
-        out_lr[i * 2 + 1] = (int16_t)(out_r * p->volume * 32767.0f);
-    }
-
-    /* Advance compressor envelope state in sync with audio input even while
-     * aubio is not yet wired, to keep comp_env decay running correctly. */
-    if (audio_in) {
-        for (int i = 0; i < frames; i++) {
-            float raw = audio_in[i * 2] * p->input_gain / 32768.0f;
-            compress_sample(&s->comp_env, hard_limit(raw),
-                            p->comp_threshold, p->comp_ratio, p->comp_makeup,
-                            comp_atk, comp_rel);
-        }
+        audio_inout[i * 2 + 0] = (int16_t)(out_l * p->volume * 32767.0f);
+        audio_inout[i * 2 + 1] = (int16_t)(out_r * p->volume * 32767.0f);
     }
 }
 
@@ -479,20 +471,19 @@ static int plugin_get_error(void *instance, char *buf, int buf_len) {
 }
 
 /* -------------------------------------------------------------------------
- * Plugin entry point — must match the symbol Schwung looks up via dlsym()
+ * Plugin entry point — symbol looked up via dlsym() for audio_fx modules
  * ---------------------------------------------------------------------- */
-static plugin_api_v2_t g_plugin = {
-    .api_version      = 2,
+static audio_fx_api_v2_t g_plugin = {
+    .api_version      = AUDIO_FX_API_VERSION_2,
     .create_instance  = plugin_create,
     .destroy_instance = plugin_destroy,
-    .on_midi          = plugin_on_midi,
+    .process_block    = plugin_process_block,
     .set_param        = plugin_set_param,
     .get_param        = plugin_get_param,
-    .get_error        = plugin_get_error,
-    .render_block     = plugin_render_block,
+    .on_midi          = plugin_on_midi,
 };
 
-plugin_api_v2_t *move_plugin_init_v2(const host_api_v1_t *host) {
+audio_fx_api_v2_t *move_audio_fx_init_v2(const host_api_v1_t *host) {
     g_host = host;
     return &g_plugin;
 }

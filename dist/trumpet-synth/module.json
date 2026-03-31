@@ -7,7 +7,7 @@
   "author": "andrewcolman",
   "abbrev": "TrSyn",
   "ui": "ui.js",
-  "dsp": "trumpet-synth.so",
+  "dsp": "dsp.so",
   "ui_chain": "ui_chain.js",
   "capabilities": {
     "audio_out": true,

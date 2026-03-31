@@ -1,0 +1,37 @@
+{
+  "title": "Trumpet Synth",
+  "sections": [
+    {
+      "heading": "Overview",
+      "body": "Monophonic pitch-tracking synthesizer driven by trumpet audio input via a Roland Silent Brass system. Detects pitch in real time using aubio and generates synthesized audio through an oscillator, ADSR envelope, and Airwindows Capacitor filter."
+    },
+    {
+      "heading": "Signal Path",
+      "body": "Audio In → Hard Limiter → Compressor → Pitch Detection (aubio) → Oscillator → ADSR Envelope → Capacitor Filter → Output"
+    },
+    {
+      "heading": "Input",
+      "body": "input_gain: scales the incoming audio before the protection stage. pitch_confidence: minimum aubio confidence (0–1) required before a note triggers; raise this in noisy environments. pitch_smooth: one-pole smoother applied to the detected frequency — higher values give a more legato pitch response."
+    },
+    {
+      "heading": "Compressor",
+      "body": "Soft feed-forward compressor that follows the hard limiter (fixed clip at ±1.0 FS). comp_threshold sets the linear amplitude above which compression begins (0.1–1.0). comp_ratio sets the compression ratio (1:1 = no compression, 20:1 = near-limiting). comp_makeup applies post-compression gain (0–4×). Together with the limiter, these protect the pitch detector from transient overloads and normalise the input level."
+    },
+    {
+      "heading": "Oscillator",
+      "body": "Four waveforms: sine, triangle, saw (default), square. osc_detune offsets the pitch in cents (±100). osc_level sets the oscillator amplitude before the envelope."
+    },
+    {
+      "heading": "Envelope",
+      "body": "Standard ADSR triggered by the pitch gate. Attack, Decay, and Release times are in seconds. Sustain is a 0–1 level."
+    },
+    {
+      "heading": "Filter",
+      "body": "Airwindows Capacitor low-pass filter applied after the envelope. filter_cutoff sets the corner frequency (20–20000 Hz). filter_reso adds resonance (0–1)."
+    },
+    {
+      "heading": "Chain Use",
+      "body": "Place as a sound generator in a Signal Chain patch. Hardware knobs map to: Cutoff, Resonance, Comp Threshold, Volume."
+    }
+  ]
+}

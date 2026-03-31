@@ -38,22 +38,22 @@ compile() {
         dsp/trumpet_synth.c \
         -Iinclude \
         -I"${AUBIO_INCLUDE}" \
-        -o build/dsp.so \
+        -o build/trumpet-synth.so \
         "${AUBIO_STATIC}" \
         -lm
 
     echo "  Verifying binary..."
-    file build/dsp.so
-    ${CROSS_PREFIX}readelf -d build/dsp.so | grep NEEDED || true
+    file build/trumpet-synth.so
+    ${CROSS_PREFIX}readelf -d build/trumpet-synth.so | grep NEEDED || true
 
     echo "  Assembling dist/..."
     rm -rf "dist/${MODULE_ID}"
     mkdir -p "dist/${MODULE_ID}"
-    cp module.json   "dist/${MODULE_ID}/"
-    cp ui.js         "dist/${MODULE_ID}/"
-    cp ui_chain.js   "dist/${MODULE_ID}/"
-    cp help.json     "dist/${MODULE_ID}/"
-    cp build/dsp.so  "dist/${MODULE_ID}/"
+    cp module.json              "dist/${MODULE_ID}/"
+    cp ui.js                    "dist/${MODULE_ID}/"
+    cp ui_chain.js              "dist/${MODULE_ID}/"
+    cp help.json                "dist/${MODULE_ID}/"
+    cp build/trumpet-synth.so  "dist/${MODULE_ID}/"
 }
 
 # ---------------------------------------------------------------------------
