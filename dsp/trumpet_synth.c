@@ -4,12 +4,12 @@
  *
  * Signal path:
  *   Audio input (trumpet via Roland Silent Brass)
+ *     → Hard limiter (clip ±1.0)
+ *     → Soft compressor (peak-following, feed-forward)
  *     → aubio pitch detection
  *     → Oscillator (sine / triangle / saw / square)
- *     → Airwindows Capacitor low-pass filter
  *     → ADSR envelope
- *     → Envelope follower modulation
- *     → LFO (targets: pitch, filter, amp)
+ *     → Airwindows Capacitor low-pass filter
  *     → Stereo output
  *
  * Plugin API: Schwung plugin_api_v2_t
@@ -37,17 +37,18 @@
 typedef struct {
     /* Input conditioning */
     float input_gain;
-    float pitch_confidence;   /* minimum aubio confidence threshold */
-    float pitch_smooth;       /* one-pole smoothing coefficient for detected pitch */
+    float pitch_confidence;   /* minimum aubio confidence threshold (0..1) */
+    float pitch_smooth;       /* one-pole pitch smoother time constant (s)  */
+
+    /* Input protection: hard limiter (fixed) → soft compressor */
+    float comp_threshold;     /* linear amplitude at which compression begins (0..1) */
+    float comp_ratio;         /* compression ratio (1 = no compression, 20 = hard limit) */
+    float comp_makeup;        /* post-compression makeup gain (linear, 0..4) */
 
     /* Oscillator */
     int   osc_wave;           /* 0=sine 1=tri 2=saw 3=square */
     float osc_detune;         /* cents, -100..+100 */
     float osc_level;
-
-    /* Airwindows Capacitor filter */
-    float filter_cutoff;      /* Hz */
-    float filter_reso;        /* 0..1 */
 
     /* ADSR */
     float env_attack;
@@ -55,15 +56,9 @@ typedef struct {
     float env_sustain;
     float env_release;
 
-    /* Envelope follower */
-    float follow_attack;
-    float follow_release;
-    float follow_amount;
-
-    /* LFO */
-    float lfo_rate;
-    float lfo_depth;
-    int   lfo_target;         /* 0=pitch 1=filter 2=amp */
+    /* Airwindows Capacitor filter */
+    float filter_cutoff;      /* Hz */
+    float filter_reso;        /* 0..1 */
 
     /* Output */
     float volume;
@@ -92,6 +87,9 @@ typedef struct {
     /* fvec_t        *pitch_buf; */
     /* fvec_t        *pitch_out; */
 
+    /* Input protection */
+    float comp_env;           /* compressor peak envelope state */
+
     /* Pitch tracking */
     float detected_hz;        /* raw aubio output */
     float smoothed_hz;        /* after one-pole smoother */
@@ -100,19 +98,13 @@ typedef struct {
     /* Oscillator */
     float osc_phase;          /* 0..1 */
 
-    /* Airwindows Capacitor internal state */
-    float cap_low[2];         /* lowpass state, L + R */
-    float cap_band[2];        /* bandpass state, L + R */
-
     /* ADSR */
     EnvStage env_stage;
     float    env_value;
 
-    /* Envelope follower */
-    float follow_env;
-
-    /* LFO */
-    float lfo_phase;          /* 0..1 */
+    /* Airwindows Capacitor internal state */
+    float cap_low[2];         /* lowpass state, L + R */
+    float cap_band[2];        /* bandpass state, L + R */
 
     /* Parameters (live copy, updated via set_param) */
     Params p;
@@ -137,40 +129,29 @@ static int parse_wave(const char *val) {
     return 2;
 }
 
-static int parse_lfo_target(const char *val) {
-    if (!val) return 0;
-    if (strcmp(val, "filter") == 0) return 1;
-    if (strcmp(val, "amp")    == 0) return 2;
-    return 0; /* pitch */
-}
-
 /* -------------------------------------------------------------------------
  * Default parameters
  * ---------------------------------------------------------------------- */
 static void params_init_defaults(Params *p) {
     p->input_gain       = 1.0f;
     p->pitch_confidence = 0.8f;
-    p->pitch_smooth     = 0.1f;
+    p->pitch_smooth     = 0.05f;
+
+    p->comp_threshold   = 0.8f;   /* compress above 80% full scale */
+    p->comp_ratio       = 4.0f;   /* 4:1 */
+    p->comp_makeup      = 1.0f;
 
     p->osc_wave         = 2;      /* saw */
     p->osc_detune       = 0.0f;
     p->osc_level        = 0.8f;
-
-    p->filter_cutoff    = 4000.0f;
-    p->filter_reso      = 0.3f;
 
     p->env_attack       = 0.01f;
     p->env_decay        = 0.1f;
     p->env_sustain      = 0.7f;
     p->env_release      = 0.2f;
 
-    p->follow_attack    = 0.005f;
-    p->follow_release   = 0.1f;
-    p->follow_amount    = 0.5f;
-
-    p->lfo_rate         = 4.0f;
-    p->lfo_depth        = 0.0f;
-    p->lfo_target       = 0;
+    p->filter_cutoff    = 4000.0f;
+    p->filter_reso      = 0.3f;
 
     p->volume           = 0.8f;
 }
@@ -187,14 +168,13 @@ static void *plugin_create(const char *module_dir, const char *json_defaults) {
 
     params_init_defaults(&s->p);
 
+    s->comp_env    = 0.0f;
     s->detected_hz = 440.0f;
     s->smoothed_hz = 440.0f;
     s->gate        = 0;
     s->osc_phase   = 0.0f;
-    s->lfo_phase   = 0.0f;
     s->env_stage   = ENV_IDLE;
     s->env_value   = 0.0f;
-    s->follow_env  = 0.0f;
 
     /* TODO: initialise aubio pitch detector
      *   s->pitch_buf = new_fvec(BLOCK_SIZE);
@@ -231,21 +211,18 @@ static void plugin_set_param(void *instance, const char *key, const char *val) {
     if      (strcmp(key, "input_gain")       == 0) p->input_gain       = parse_float(val, p->input_gain);
     else if (strcmp(key, "pitch_confidence") == 0) p->pitch_confidence = parse_float(val, p->pitch_confidence);
     else if (strcmp(key, "pitch_smooth")     == 0) p->pitch_smooth     = parse_float(val, p->pitch_smooth);
+    else if (strcmp(key, "comp_threshold")   == 0) p->comp_threshold   = parse_float(val, p->comp_threshold);
+    else if (strcmp(key, "comp_ratio")       == 0) p->comp_ratio       = parse_float(val, p->comp_ratio);
+    else if (strcmp(key, "comp_makeup")      == 0) p->comp_makeup      = parse_float(val, p->comp_makeup);
     else if (strcmp(key, "osc_wave")         == 0) p->osc_wave         = parse_wave(val);
     else if (strcmp(key, "osc_detune")       == 0) p->osc_detune       = parse_float(val, p->osc_detune);
     else if (strcmp(key, "osc_level")        == 0) p->osc_level        = parse_float(val, p->osc_level);
-    else if (strcmp(key, "filter_cutoff")    == 0) p->filter_cutoff    = parse_float(val, p->filter_cutoff);
-    else if (strcmp(key, "filter_reso")      == 0) p->filter_reso      = parse_float(val, p->filter_reso);
     else if (strcmp(key, "env_attack")       == 0) p->env_attack       = parse_float(val, p->env_attack);
     else if (strcmp(key, "env_decay")        == 0) p->env_decay        = parse_float(val, p->env_decay);
     else if (strcmp(key, "env_sustain")      == 0) p->env_sustain      = parse_float(val, p->env_sustain);
     else if (strcmp(key, "env_release")      == 0) p->env_release      = parse_float(val, p->env_release);
-    else if (strcmp(key, "follow_attack")    == 0) p->follow_attack    = parse_float(val, p->follow_attack);
-    else if (strcmp(key, "follow_release")   == 0) p->follow_release   = parse_float(val, p->follow_release);
-    else if (strcmp(key, "follow_amount")    == 0) p->follow_amount    = parse_float(val, p->follow_amount);
-    else if (strcmp(key, "lfo_rate")         == 0) p->lfo_rate         = parse_float(val, p->lfo_rate);
-    else if (strcmp(key, "lfo_depth")        == 0) p->lfo_depth        = parse_float(val, p->lfo_depth);
-    else if (strcmp(key, "lfo_target")       == 0) p->lfo_target       = parse_lfo_target(val);
+    else if (strcmp(key, "filter_cutoff")    == 0) p->filter_cutoff    = parse_float(val, p->filter_cutoff);
+    else if (strcmp(key, "filter_reso")      == 0) p->filter_reso      = parse_float(val, p->filter_reso);
     else if (strcmp(key, "volume")           == 0) p->volume           = parse_float(val, p->volume);
 }
 
@@ -253,27 +230,23 @@ static int plugin_get_param(void *instance, const char *key, char *buf, int buf_
     TrumpetSynth *s = (TrumpetSynth *)instance;
     Params *p = &s->p;
 
-    static const char *wave_names[]   = { "sine", "triangle", "saw", "square" };
-    static const char *target_names[] = { "pitch", "filter", "amp" };
+    static const char *wave_names[] = { "sine", "triangle", "saw", "square" };
 
     if      (strcmp(key, "input_gain")       == 0) return snprintf(buf, buf_len, "%.4f", p->input_gain);
     else if (strcmp(key, "pitch_confidence") == 0) return snprintf(buf, buf_len, "%.4f", p->pitch_confidence);
     else if (strcmp(key, "pitch_smooth")     == 0) return snprintf(buf, buf_len, "%.4f", p->pitch_smooth);
+    else if (strcmp(key, "comp_threshold")   == 0) return snprintf(buf, buf_len, "%.4f", p->comp_threshold);
+    else if (strcmp(key, "comp_ratio")       == 0) return snprintf(buf, buf_len, "%.2f", p->comp_ratio);
+    else if (strcmp(key, "comp_makeup")      == 0) return snprintf(buf, buf_len, "%.4f", p->comp_makeup);
     else if (strcmp(key, "osc_wave")         == 0) return snprintf(buf, buf_len, "%s",   wave_names[p->osc_wave]);
     else if (strcmp(key, "osc_detune")       == 0) return snprintf(buf, buf_len, "%.2f", p->osc_detune);
     else if (strcmp(key, "osc_level")        == 0) return snprintf(buf, buf_len, "%.4f", p->osc_level);
-    else if (strcmp(key, "filter_cutoff")    == 0) return snprintf(buf, buf_len, "%.2f", p->filter_cutoff);
-    else if (strcmp(key, "filter_reso")      == 0) return snprintf(buf, buf_len, "%.4f", p->filter_reso);
     else if (strcmp(key, "env_attack")       == 0) return snprintf(buf, buf_len, "%.4f", p->env_attack);
     else if (strcmp(key, "env_decay")        == 0) return snprintf(buf, buf_len, "%.4f", p->env_decay);
     else if (strcmp(key, "env_sustain")      == 0) return snprintf(buf, buf_len, "%.4f", p->env_sustain);
     else if (strcmp(key, "env_release")      == 0) return snprintf(buf, buf_len, "%.4f", p->env_release);
-    else if (strcmp(key, "follow_attack")    == 0) return snprintf(buf, buf_len, "%.4f", p->follow_attack);
-    else if (strcmp(key, "follow_release")   == 0) return snprintf(buf, buf_len, "%.4f", p->follow_release);
-    else if (strcmp(key, "follow_amount")    == 0) return snprintf(buf, buf_len, "%.4f", p->follow_amount);
-    else if (strcmp(key, "lfo_rate")         == 0) return snprintf(buf, buf_len, "%.4f", p->lfo_rate);
-    else if (strcmp(key, "lfo_depth")        == 0) return snprintf(buf, buf_len, "%.4f", p->lfo_depth);
-    else if (strcmp(key, "lfo_target")       == 0) return snprintf(buf, buf_len, "%s",   target_names[p->lfo_target]);
+    else if (strcmp(key, "filter_cutoff")    == 0) return snprintf(buf, buf_len, "%.2f", p->filter_cutoff);
+    else if (strcmp(key, "filter_reso")      == 0) return snprintf(buf, buf_len, "%.4f", p->filter_reso);
     else if (strcmp(key, "volume")           == 0) return snprintf(buf, buf_len, "%.4f", p->volume);
     else if (strcmp(key, "detected_hz")      == 0) return snprintf(buf, buf_len, "%.2f", s->smoothed_hz);
     else if (strcmp(key, "gate")             == 0) return snprintf(buf, buf_len, "%d",   s->gate);
@@ -305,16 +278,31 @@ static void plugin_on_midi(void *instance, const uint8_t *msg, int len, int sour
  * DSP helpers
  * ---------------------------------------------------------------------- */
 
-/* One-pole envelope follower, returns level 0..1 */
-static inline float env_follower_tick(float *env, float in,
-                                      float attack_coef,
-                                      float release_coef) {
-    float abs_in = fabsf(in);
-    if (abs_in > *env)
-        *env += attack_coef  * (abs_in - *env);
+/* Hard limiter — clips to ±1.0 */
+static inline float hard_limit(float x) {
+    if (x >  1.0f) return  1.0f;
+    if (x < -1.0f) return -1.0f;
+    return x;
+}
+
+/* Soft feed-forward compressor — peak envelope detector, sample-by-sample.
+ * atk_tc / rel_tc are one-pole coefficients (pre-computed once per block).
+ * Returns the gain-reduced, makeup-amplified sample. */
+static inline float compress_sample(float *env, float in,
+                                    float threshold, float ratio, float makeup,
+                                    float atk_tc, float rel_tc) {
+    float level = fabsf(in);
+    if (level > *env)
+        *env += atk_tc * (level - *env);
     else
-        *env += release_coef * (abs_in - *env);
-    return *env;
+        *env += rel_tc * (level - *env);
+
+    float gain = 1.0f;
+    if (*env > threshold && threshold > 0.0f) {
+        float reduced = threshold + (*env - threshold) / ratio;
+        gain = reduced / *env;
+    }
+    return in * gain * makeup;
 }
 
 /* ADSR tick — returns envelope amplitude 0..1 */
@@ -355,7 +343,7 @@ static inline float adsr_tick(TrumpetSynth *s) {
     return s->env_value;
 }
 
-/* Simple bandlimited saw (Blep-free placeholder — TODO: PolyBlep) */
+/* Oscillator — naive waveforms (TODO: PolyBlep for saw/square) */
 static inline float osc_tick(TrumpetSynth *s, float freq_hz) {
     float phase = s->osc_phase;
     float sample;
@@ -369,7 +357,7 @@ static inline float osc_tick(TrumpetSynth *s, float freq_hz) {
                      ? (4.0f * phase - 1.0f)
                      : (3.0f - 4.0f * phase);
             break;
-        case 2: /* saw (naive) */
+        case 2: /* saw */
             sample = 2.0f * phase - 1.0f;
             break;
         case 3: /* square */
@@ -385,16 +373,16 @@ static inline float osc_tick(TrumpetSynth *s, float freq_hz) {
     return sample;
 }
 
-/* Airwindows Capacitor (low-pass only) — placeholder coefficients.
+/* Airwindows Capacitor (low-pass) — placeholder IIR.
  * TODO: replace with full Airwindows Capacitor2 implementation. */
 static inline float capacitor_tick(TrumpetSynth *s, float in, int ch) {
     Params *p = &s->p;
     float cutoff = p->filter_cutoff / (SAMPLE_RATE * 0.5f);
     if (cutoff > 1.0f) cutoff = 1.0f;
 
-    float iir_amount = cutoff * (1.0f - p->filter_reso * 0.5f);
-    s->cap_low[ch]  += iir_amount * (in            - s->cap_low[ch]);
-    s->cap_band[ch] += iir_amount * (s->cap_low[ch] - s->cap_band[ch]);
+    float iir = cutoff * (1.0f - p->filter_reso * 0.5f);
+    s->cap_low[ch]  += iir * (in             - s->cap_low[ch]);
+    s->cap_band[ch] += iir * (s->cap_low[ch] - s->cap_band[ch]);
 
     return s->cap_low[ch];
 }
@@ -403,105 +391,80 @@ static inline float capacitor_tick(TrumpetSynth *s, float in, int ch) {
  * Render block
  * ---------------------------------------------------------------------- */
 static void plugin_render_block(void *instance, int16_t *out_lr, int frames) {
-    TrumpetSynth *s  = (TrumpetSynth *)instance;
-    Params        *p = &s->p;
+    TrumpetSynth *s = (TrumpetSynth *)instance;
+    Params       *p = &s->p;
 
-    /* --- Audio input buffer (stereo interleaved int16 from host shared memory) --- */
+    /* Audio input buffer from host shared memory (stereo interleaved int16) */
     const int16_t *audio_in = NULL;
     if (g_host && g_host->mapped_memory)
         audio_in = (const int16_t *)(g_host->mapped_memory + g_host->audio_in_offset);
 
-    /* --- Pitch detection (TODO: wire in aubio) ---
+    /* Compressor time constants — 1 ms attack, 100 ms release.
+     * These are constant expressions; -O3 evaluates them at compile time. */
+    const float comp_atk = 1.0f - expf(-1.0f / (SAMPLE_RATE * 0.001f));
+    const float comp_rel = 1.0f - expf(-1.0f / (SAMPLE_RATE * 0.100f));
+
+    /* --- Input protection + pitch detection (TODO: wire in aubio) -------
      *
-     * Copy the mono-downmix of audio_in into the aubio input vector, then
-     * call aubio_pitch_do().  audio_in is stereo interleaved so use [i*2].
+     * Run the full input chain once per block before synthesis, feeding the
+     * compressor-conditioned mono signal into the aubio pitch buffer:
      *
-     *   for (int i = 0; i < frames; i++)
-     *       s->pitch_buf->data[i] = audio_in
-     *           ? (smpl_t)(audio_in[i*2] * p->input_gain / 32768.0f)
-     *           : 0.0f;
-     *
+     *   for (int i = 0; i < frames; i++) {
+     *       float raw   = audio_in
+     *                   ? (audio_in[i * 2] * p->input_gain / 32768.0f)
+     *                   : 0.0f;
+     *       float cond  = compress_sample(&s->comp_env,
+     *                                     hard_limit(raw),
+     *                                     p->comp_threshold, p->comp_ratio,
+     *                                     p->comp_makeup,
+     *                                     comp_atk, comp_rel);
+     *       s->pitch_buf->data[i] = (smpl_t)cond;
+     *   }
      *   aubio_pitch_do(s->pitch_obj, s->pitch_buf, s->pitch_out);
      *   float conf = aubio_pitch_get_confidence(s->pitch_obj);
      *   float hz   = s->pitch_out->data[0];
-     *
      *   if (conf >= p->pitch_confidence && hz > 20.0f && hz < 4000.0f) {
      *       s->detected_hz = hz;
      *       if (!s->gate) { s->gate = 1; s->env_stage = ENV_ATTACK; }
      *   } else {
      *       if (s->gate) { s->gate = 0; s->env_stage = ENV_RELEASE; }
      *   }
-     */
+     * ------------------------------------------------------------------- */
 
-    /* One-pole pitch smoother coefficient */
-    float smooth_coef = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->pitch_smooth, 1e-4f)));
-
-    /* Pre-compute time-to-coefficient conversions for envelope follower */
-    float flw_att  = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->follow_attack,  1e-4f)));
-    float flw_rel  = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->follow_release, 1e-4f)));
+    /* Pitch smoother coefficient */
+    const float smooth_coef = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->pitch_smooth, 1e-4f)));
 
     for (int i = 0; i < frames; i++) {
-        /* --- Smooth detected pitch --- */
+        /* Smooth detected pitch toward target */
         s->smoothed_hz += smooth_coef * (s->detected_hz - s->smoothed_hz);
 
-        /* --- LFO --- */
-        float lfo_val = sinf(2.0f * (float)M_PI * s->lfo_phase);
-        s->lfo_phase += p->lfo_rate / SAMPLE_RATE;
-        if (s->lfo_phase >= 1.0f) s->lfo_phase -= 1.0f;
+        /* Oscillator frequency with detune */
+        float freq = s->smoothed_hz * powf(2.0f, p->osc_detune / 1200.0f);
 
-        /* --- Compute oscillator frequency with detune and optional LFO --- */
-        float freq = s->smoothed_hz
-                     * powf(2.0f, p->osc_detune / 1200.0f)
-                     * ((p->lfo_target == 0)
-                        ? (1.0f + lfo_val * p->lfo_depth * 0.1f)
-                        : 1.0f);
-
-        /* --- Oscillator --- */
+        /* Oscillator */
         float osc = osc_tick(s, freq) * p->osc_level;
 
-        /* --- Filter cutoff modulated by LFO if target == filter --- */
-        if (p->lfo_target == 1) {
-            /* modulation applied inside capacitor via temporary param override
-             * is deferred; direct approach: scale cutoff here */
-            float orig_cutoff = p->filter_cutoff;
-            p->filter_cutoff  = orig_cutoff * (1.0f + lfo_val * p->lfo_depth);
-            if (p->filter_cutoff < 20.0f)    p->filter_cutoff = 20.0f;
-            if (p->filter_cutoff > 20000.0f) p->filter_cutoff = 20000.0f;
-            float filtered_l = capacitor_tick(s, osc, 0);
-            float filtered_r = capacitor_tick(s, osc, 1);
-            p->filter_cutoff  = orig_cutoff;
-            osc = (filtered_l + filtered_r) * 0.5f;
-        } else {
-            float filtered_l = capacitor_tick(s, osc, 0);
-            float filtered_r = capacitor_tick(s, osc, 1);
-            osc = (filtered_l + filtered_r) * 0.5f;
-        }
-
-        /* --- ADSR envelope --- */
+        /* ADSR envelope */
         float env = adsr_tick(s);
 
-        /* --- Envelope follower (tracks input loudness, drives amplitude) ---
-         * Use the left channel of audio_in when available; fall back to osc. */
-        float in_sample = audio_in ? (audio_in[i * 2] * p->input_gain / 32768.0f) : osc;
-        float follow = env_follower_tick(&s->follow_env, in_sample, flw_att, flw_rel);
+        /* Airwindows Capacitor filter — same signal to both channels */
+        float out_l = capacitor_tick(s, osc * env, 0);
+        float out_r = capacitor_tick(s, osc * env, 1);
 
-        /* Mix ADSR and follower */
-        float combined_env = env * (1.0f - p->follow_amount)
-                           + follow * p->follow_amount;
+        /* Output */
+        out_lr[i * 2 + 0] = (int16_t)(out_l * p->volume * 32767.0f);
+        out_lr[i * 2 + 1] = (int16_t)(out_r * p->volume * 32767.0f);
+    }
 
-        /* --- Amplitude LFO --- */
-        float amp = combined_env;
-        if (p->lfo_target == 2) {
-            amp *= (1.0f + lfo_val * p->lfo_depth * 0.5f);
-            if (amp < 0.0f) amp = 0.0f;
+    /* Advance compressor envelope state in sync with audio input even while
+     * aubio is not yet wired, to keep comp_env decay running correctly. */
+    if (audio_in) {
+        for (int i = 0; i < frames; i++) {
+            float raw = audio_in[i * 2] * p->input_gain / 32768.0f;
+            compress_sample(&s->comp_env, hard_limit(raw),
+                            p->comp_threshold, p->comp_ratio, p->comp_makeup,
+                            comp_atk, comp_rel);
         }
-
-        /* --- Output --- */
-        float sample = osc * amp * p->volume;
-        int16_t out  = (int16_t)(sample * 32767.0f);
-
-        out_lr[i * 2 + 0] = out; /* L */
-        out_lr[i * 2 + 1] = out; /* R */
     }
 }
 

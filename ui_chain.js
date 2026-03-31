@@ -9,7 +9,7 @@
  *
  *   Knob 0 → filter_cutoff
  *   Knob 1 → filter_reso
- *   Knob 2 → lfo_depth
+ *   Knob 2 → comp_threshold
  *   Knob 3 → volume
  */
 
@@ -19,10 +19,10 @@
  * Knob → parameter mapping
  * ---------------------------------------------------------------------- */
 const KNOB_PARAMS = [
-    { key: 'filter_cutoff', min: 20,   max: 20000, label: 'CUT' },
-    { key: 'filter_reso',   min: 0.0,  max: 1.0,   label: 'RES' },
-    { key: 'lfo_depth',     min: 0.0,  max: 1.0,   label: 'LFO' },
-    { key: 'volume',        min: 0.0,  max: 1.0,   label: 'VOL' },
+    { key: 'filter_cutoff',  min: 20,  max: 20000, label: 'CUT' },
+    { key: 'filter_reso',    min: 0.0, max: 1.0,   label: 'RES' },
+    { key: 'comp_threshold', min: 0.1, max: 1.0,   label: 'THR' },
+    { key: 'volume',         min: 0.0, max: 1.0,   label: 'VOL' },
 ];
 
 function knobValueToParam(knobIndex, value0to1) {

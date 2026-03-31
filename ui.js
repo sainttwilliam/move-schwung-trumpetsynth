@@ -15,7 +15,7 @@
  * ---------------------------------------------------------------------- */
 let detectedHz   = 0.0;
 let gate         = false;
-let paramPage    = 0; /* 0=overview 1=osc 2=filter 3=env 4=lfo */
+let paramPage    = 0; /* 0=overview 1=comp 2=osc 3=env 4=filter */
 const PAGE_COUNT = 5;
 
 /* -------------------------------------------------------------------------
@@ -75,10 +75,10 @@ function drawScreen() {
     /* Parameter overview by page */
     switch (paramPage) {
         case 0: drawOverview();  break;
-        case 1: drawOscPage();   break;
-        case 2: drawFilterPage();break;
+        case 1: drawCompPage();  break;
+        case 2: drawOscPage();   break;
         case 3: drawEnvPage();   break;
-        case 4: drawLfoPage();   break;
+        case 4: drawFilterPage();break;
     }
 
     /* Page dots */
@@ -120,11 +120,14 @@ function drawEnvPage() {
     print(0, 52, 'R ' + (host_module_get_param('env_release') || '-') + 's', 1);
 }
 
-function drawLfoPage() {
-    print(0, 21, 'LFO',                                                           1);
-    print(0, 31, 'Rate   ' + (host_module_get_param('lfo_rate')   || '-') + ' Hz', 1);
-    print(0, 41, 'Depth  ' + (host_module_get_param('lfo_depth')  || '-'),          1);
-    print(0, 51, 'Target ' + (host_module_get_param('lfo_target') || '-'),          1);
+function drawCompPage() {
+    const thr = parseFloat(host_module_get_param('comp_threshold') || '0.8');
+    /* Display threshold as dBFS for readability */
+    const thrDb = thr > 0 ? (20 * Math.log10(thr)).toFixed(1) : '-inf';
+    print(0, 21, 'COMPRESSOR',                                                       1);
+    print(0, 31, 'Thr  ' + thrDb + ' dBFS',                                         1);
+    print(0, 41, 'Rat  ' + (host_module_get_param('comp_ratio')  || '-') + ':1',     1);
+    print(0, 51, 'Mkup ' + (host_module_get_param('comp_makeup') || '-'),             1);
 }
 
 /* -------------------------------------------------------------------------
