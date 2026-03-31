@@ -1,0 +1,119 @@
+name: Release
+
+# Trigger on version tags: git tag v0.1.0 && git push --tags
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Verify the tag version matches module.json before doing any work
+      # ------------------------------------------------------------------
+      - name: Check version matches module.json
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MODULE_VERSION=$(python3 -c \
+            "import json; print(json.load(open('module.json'))['version'])")
+          if [ "$TAG_VERSION" != "$MODULE_VERSION" ]; then
+            echo "ERROR: tag $GITHUB_REF_NAME => $TAG_VERSION"
+            echo "       module.json version  => $MODULE_VERSION"
+            echo "Update module.json version before tagging."
+            exit 1
+          fi
+          echo "Version: $TAG_VERSION — OK"
+
+      # ------------------------------------------------------------------
+      # Build Docker image (cached between runs if Dockerfile unchanged)
+      # ------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag trumpet-synth-builder \
+            --file scripts/Dockerfile \
+            scripts/
+
+      # ------------------------------------------------------------------
+      # Cross-compile inside Docker
+      # ------------------------------------------------------------------
+      - name: Cross-compile for aarch64
+        run: |
+          docker run --rm \
+            --volume "$PWD:/build" \
+            --workdir /build \
+            trumpet-synth-builder \
+            bash scripts/build.sh
+
+      # ------------------------------------------------------------------
+      # Package as a tarball matching the Module Store convention:
+      #   trumpet-synth-module.tar.gz
+      #   └── trumpet-synth/
+      #       ├── module.json
+      #       ├── ui.js
+      #       ├── ui_chain.js
+      #       ├── help.json
+      #       └── dsp.so
+      # ------------------------------------------------------------------
+      - name: Package release tarball
+        run: |
+          tar --format=posix \
+              -czf trumpet-synth-module.tar.gz \
+              -C dist \
+              trumpet-synth
+          echo "Tarball contents:"
+          tar -tzvf trumpet-synth-module.tar.gz
+
+      # ------------------------------------------------------------------
+      # Publish GitHub Release with the tarball
+      # ------------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: trumpet-synth-module.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # Update release.json on main so the Module Store can discover us
+      # ------------------------------------------------------------------
+      - name: Update release.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO="${{ github.repository }}"
+          TAG="${{ github.ref_name }}"
+          cat > release.json <<EOF
+          {
+            "version": "${VERSION}",
+            "download_url": "https://github.com/${REPO}/releases/download/${TAG}/trumpet-synth-module.tar.gz"
+          }
+          EOF
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -f main
+          # Write again on main branch
+          cat > release.json <<EOF
+          {
+            "version": "${VERSION}",
+            "download_url": "https://github.com/${REPO}/releases/download/${TAG}/trumpet-synth-module.tar.gz"
+          }
+          EOF
+          git add release.json
+          if git diff --cached --quiet; then
+            echo "release.json already up to date"
+          else
+            git commit -m "chore: update release.json for ${TAG}"
+            git push origin main
+          fi

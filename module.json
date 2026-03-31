@@ -1,0 +1,77 @@
+{
+  "id": "trumpet-synth",
+  "name": "Trumpet Synth",
+  "version": "0.1.0",
+  "api_version": 2,
+  "description": "Monophonic pitch-tracking synthesizer driven by trumpet audio input via Roland Silent Brass. Tracks pitch with aubio and synthesizes audio using oscillators, Capacitor filter, ADSR, envelope follower, and LFO.",
+  "author": "andrewcolman",
+  "abbrev": "TrSyn",
+  "ui": "ui.js",
+  "dsp": "dsp.so",
+  "ui_chain": "ui_chain.js",
+  "capabilities": {
+    "audio_out": true,
+    "audio_in": true,
+    "midi_in": true,
+    "chainable": true,
+    "component_type": "sound_generator"
+  },
+  "ui_hierarchy": {
+    "levels": [
+      {
+        "name": "Input",
+        "params": [
+          { "key": "input_gain",       "name": "Input Gain",       "type": "float", "min": 0.0,  "max": 4.0,  "default": 1.0 },
+          { "key": "pitch_confidence", "name": "Min Confidence",   "type": "float", "min": 0.0,  "max": 1.0,  "default": 0.8 },
+          { "key": "pitch_smooth",     "name": "Pitch Smooth",     "type": "float", "min": 0.0,  "max": 1.0,  "default": 0.1 }
+        ]
+      },
+      {
+        "name": "Oscillator",
+        "params": [
+          { "key": "osc_wave",   "name": "Waveform",  "type": "enum",  "values": ["sine", "triangle", "saw", "square"], "default": "saw" },
+          { "key": "osc_detune", "name": "Detune",    "type": "float", "min": -100.0, "max": 100.0, "default": 0.0 },
+          { "key": "osc_level",  "name": "Level",     "type": "float", "min": 0.0,   "max": 1.0,   "default": 0.8 }
+        ]
+      },
+      {
+        "name": "Filter",
+        "params": [
+          { "key": "filter_cutoff", "name": "Cutoff",    "type": "float", "min": 20.0,  "max": 20000.0, "default": 4000.0 },
+          { "key": "filter_reso",   "name": "Resonance", "type": "float", "min": 0.0,   "max": 1.0,     "default": 0.3 }
+        ]
+      },
+      {
+        "name": "Envelope",
+        "params": [
+          { "key": "env_attack",  "name": "Attack",  "type": "float", "min": 0.001, "max": 2.0, "default": 0.01 },
+          { "key": "env_decay",   "name": "Decay",   "type": "float", "min": 0.001, "max": 2.0, "default": 0.1  },
+          { "key": "env_sustain", "name": "Sustain", "type": "float", "min": 0.0,   "max": 1.0, "default": 0.7  },
+          { "key": "env_release", "name": "Release", "type": "float", "min": 0.001, "max": 4.0, "default": 0.2  }
+        ]
+      },
+      {
+        "name": "Env Follower",
+        "params": [
+          { "key": "follow_attack",  "name": "Flw Attack",  "type": "float", "min": 0.001, "max": 1.0, "default": 0.005 },
+          { "key": "follow_release", "name": "Flw Release", "type": "float", "min": 0.001, "max": 2.0, "default": 0.1   },
+          { "key": "follow_amount",  "name": "Flw Amount",  "type": "float", "min": 0.0,   "max": 1.0, "default": 0.5   }
+        ]
+      },
+      {
+        "name": "LFO",
+        "params": [
+          { "key": "lfo_rate",   "name": "LFO Rate",   "type": "float", "min": 0.01, "max": 20.0, "default": 4.0  },
+          { "key": "lfo_depth",  "name": "LFO Depth",  "type": "float", "min": 0.0,  "max": 1.0,  "default": 0.0  },
+          { "key": "lfo_target", "name": "LFO Target", "type": "enum",  "values": ["pitch", "filter", "amp"], "default": "pitch" }
+        ]
+      },
+      {
+        "name": "Output",
+        "params": [
+          { "key": "volume", "name": "Volume", "type": "float", "min": 0.0, "max": 1.0, "default": 0.8 }
+        ]
+      }
+    ]
+  }
+}

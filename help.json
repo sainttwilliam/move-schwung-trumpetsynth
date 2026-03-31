@@ -1,0 +1,41 @@
+{
+  "title": "Trumpet Synth",
+  "sections": [
+    {
+      "heading": "Overview",
+      "body": "Monophonic pitch-tracking synthesizer driven by trumpet audio input via a Roland Silent Brass system. Detects pitch in real time using aubio and generates synthesized audio through an oscillator, Airwindows Capacitor filter, ADSR envelope, envelope follower, and LFO."
+    },
+    {
+      "heading": "Signal Path",
+      "body": "Audio In → Pitch Detection (aubio) → Oscillator → Capacitor Filter → ADSR Envelope → Envelope Follower → LFO → Output"
+    },
+    {
+      "heading": "Input",
+      "body": "input_gain: scales the incoming audio before pitch detection. pitch_confidence: minimum aubio confidence (0–1) required before a note triggers; raise this in noisy environments. pitch_smooth: one-pole smoother applied to the detected frequency — higher values give a more legato response."
+    },
+    {
+      "heading": "Oscillator",
+      "body": "Four waveforms: sine, triangle, saw (default), square. osc_detune offsets the pitch in cents (±100). osc_level sets the oscillator amplitude before filtering."
+    },
+    {
+      "heading": "Filter",
+      "body": "Airwindows Capacitor low-pass filter. filter_cutoff sets the corner frequency (20–20000 Hz). filter_reso adds resonance (0–1)."
+    },
+    {
+      "heading": "Envelope",
+      "body": "Standard ADSR triggered by the pitch gate. Attack, Decay, and Release times are in seconds. Sustain is a 0–1 level."
+    },
+    {
+      "heading": "Envelope Follower",
+      "body": "Tracks the amplitude of the input signal and modulates the output level. follow_attack and follow_release are time constants; follow_amount blends follower control with the ADSR."
+    },
+    {
+      "heading": "LFO",
+      "body": "Sine LFO with selectable target: pitch (vibrato), filter (wah), or amp (tremolo). lfo_rate is in Hz; lfo_depth scales the modulation amount."
+    },
+    {
+      "heading": "Chain Use",
+      "body": "Place as a sound generator in a Signal Chain patch. Hardware knobs map to: Cutoff, Resonance, LFO Depth, Volume."
+    }
+  ]
+}
