@@ -1,50 +1,33 @@
 /**
  * ui.js — Trumpet Synth UI
  *
- * Displays current detected pitch, gate state, and a minimal parameter
- * overview on the Move hardware screen. Full parameter editing is handled
- * via the Shadow UI (ui_hierarchy in module.json).
- *
  * Screen is 128 × 64 px (monochrome OLED).
+ * Encoder 0 cycles between display pages.
  */
 
 'use strict';
 
-/* -------------------------------------------------------------------------
- * State
- * ---------------------------------------------------------------------- */
-let detectedHz   = 0.0;
-let gate         = false;
-let paramPage    = 0; /* 0=overview 1=comp 2=osc 3=env 4=filter */
-const PAGE_COUNT = 5;
+let detectedHz = 0.0;
+let gate       = false;
+let paramPage  = 0;
 
-/* -------------------------------------------------------------------------
- * Lifecycle
- * ---------------------------------------------------------------------- */
-globalThis.init = function () {
-    /* Nothing to initialise — parameters are owned by the DSP plugin. */
-};
+const PAGE_COUNT = 3; /* 0=overview  1=oscillator  2=filter */
+
+globalThis.init = function () {};
 
 globalThis.tick = function () {
-    /* Poll runtime values from the DSP plugin */
     detectedHz = parseFloat(host_module_get_param('detected_hz') || '0');
     gate       = host_module_get_param('gate') === '1';
-
     drawScreen();
 };
 
-/* -------------------------------------------------------------------------
- * Input handling
- * ---------------------------------------------------------------------- */
 globalThis.onEncoderDelta = function (enc, delta) {
-    /* Encoder 0 (leftmost) cycles through display pages */
-    if (enc === 0) {
+    if (enc === 0)
         paramPage = ((paramPage + delta) % PAGE_COUNT + PAGE_COUNT) % PAGE_COUNT;
-    }
 };
 
-globalThis.onMidiMessageInternal = function (_msg) { /* not used */ };
-globalThis.onMidiMessageExternal = function (_msg) { /* not used */ };
+globalThis.onMidiMessageInternal = function (_msg) {};
+globalThis.onMidiMessageExternal = function (_msg) {};
 
 /* -------------------------------------------------------------------------
  * Display
@@ -52,86 +35,56 @@ globalThis.onMidiMessageExternal = function (_msg) { /* not used */ };
 function drawScreen() {
     clear_screen();
 
-    /* Title bar */
     print(0, 0, 'TRUMPET SYNTH', 1);
     draw_line(0, 8, 127, 8, 1);
 
-    /* Gate indicator */
-    if (gate) {
-        fill_rect(118, 1, 9, 6, 1);      /* solid block when gate open */
-    } else {
-        draw_rect(118, 1, 9, 6, 1);      /* outline when silent */
-    }
+    /* Gate indicator — filled square when pitch locked */
+    if (gate) fill_rect(118, 1, 9, 6, 1);
+    else      draw_rect(118, 1, 9, 6, 1);
 
     /* Detected pitch */
     const hzStr = detectedHz > 0 ? detectedHz.toFixed(1) + ' Hz' : '--- Hz';
     print(0, 11, hzStr, 1);
+    if (detectedHz > 0) print(70, 11, hzToNoteName(detectedHz), 1);
 
-    /* Note name approximation */
-    if (detectedHz > 0) {
-        print(70, 11, hzToNoteName(detectedHz), 1);
-    }
-
-    /* Parameter overview by page */
-    switch (paramPage) {
-        case 0: drawOverview();  break;
-        case 1: drawCompPage();  break;
-        case 2: drawOscPage();   break;
-        case 3: drawEnvPage();   break;
-        case 4: drawFilterPage();break;
-    }
+    if      (paramPage === 0) drawOverview();
+    else if (paramPage === 1) drawOscPage();
+    else                      drawFilterPage();
 
     /* Page dots */
     for (let i = 0; i < PAGE_COUNT; i++) {
-        if (i === paramPage) fill_rect(50 + i * 6, 60, 4, 4, 1);
-        else                 draw_rect(50 + i * 6, 60, 4, 4, 1);
+        if (i === paramPage) fill_rect(58 + i * 7, 60, 4, 4, 1);
+        else                 draw_rect(58 + i * 7, 60, 4, 4, 1);
     }
 }
 
 function drawOverview() {
-    const wave   = host_module_get_param('osc_wave')    || 'saw';
-    const cutoff = parseFloat(host_module_get_param('filter_cutoff') || '4000').toFixed(0);
-    const vol    = parseFloat(host_module_get_param('volume') || '0.8');
-    const volPct = Math.round(vol * 100);
-
+    const wave   = host_module_get_param('osc_wave') || 'saw';
+    const vol    = Math.round(parseFloat(host_module_get_param('volume') || '0.8') * 100);
+    const conf = parseFloat(host_module_get_param('pitch_confidence') || '0.8').toFixed(2);
+    const gate = parseFloat(host_module_get_param('gate_threshold')   || '0.01').toFixed(3);
     print(0, 22, 'OSC  ' + wave.toUpperCase(), 1);
-    print(0, 32, 'CUTF ' + cutoff + ' Hz',      1);
-    print(0, 42, 'VOL  ' + volPct + '%',         1);
+    print(0, 32, 'GATE ' + gate,               1);
+    print(0, 42, 'VOL  ' + vol + '%',           1);
 }
 
 function drawOscPage() {
-    print(0, 21, 'OSCILLATOR',                                             1);
-    print(0, 31, 'Wave  ' + (host_module_get_param('osc_wave')   || '-'), 1);
-    print(0, 41, 'Det   ' + (host_module_get_param('osc_detune') || '-') + ' c', 1);
-    print(0, 51, 'Lvl   ' + (host_module_get_param('osc_level')  || '-'), 1);
+    print(0, 21, 'OSCILLATOR', 1);
+    print(0, 31, 'Wave  ' + (host_module_get_param('osc_wave')   || '-'),         1);
+    print(0, 41, 'Det   ' + (host_module_get_param('osc_detune') || '-') + ' c',  1);
+    print(0, 51, 'Lvl   ' + (host_module_get_param('osc_level')  || '-'),         1);
 }
 
 function drawFilterPage() {
-    print(0, 21, 'FILTER',                                                         1);
-    print(0, 31, 'Cut  ' + (host_module_get_param('filter_cutoff') || '-') + ' Hz', 1);
-    print(0, 41, 'Res  ' + (host_module_get_param('filter_reso')   || '-'),          1);
-}
-
-function drawEnvPage() {
-    print(0, 21, 'ENVELOPE',                                              1);
-    print(0, 31, 'A ' + (host_module_get_param('env_attack')  || '-') + 's', 1);
-    print(0, 38, 'D ' + (host_module_get_param('env_decay')   || '-') + 's', 1);
-    print(0, 45, 'S ' + (host_module_get_param('env_sustain') || '-'),        1);
-    print(0, 52, 'R ' + (host_module_get_param('env_release') || '-') + 's', 1);
-}
-
-function drawCompPage() {
-    const thr = parseFloat(host_module_get_param('comp_threshold') || '0.8');
-    /* Display threshold as dBFS for readability */
-    const thrDb = thr > 0 ? (20 * Math.log10(thr)).toFixed(1) : '-inf';
-    print(0, 21, 'COMPRESSOR',                                                       1);
-    print(0, 31, 'Thr  ' + thrDb + ' dBFS',                                         1);
-    print(0, 41, 'Rat  ' + (host_module_get_param('comp_ratio')  || '-') + ':1',     1);
-    print(0, 51, 'Mkup ' + (host_module_get_param('comp_makeup') || '-'),             1);
+    print(0, 21, 'FILTER', 1);
+    const cutoff = parseFloat(host_module_get_param('filter_cutoff') || '2000');
+    const res    = parseFloat(host_module_get_param('filter_resonance') || '0.3');
+    print(0, 31, 'Cut  ' + Math.round(cutoff) + ' Hz', 1);
+    print(0, 41, 'Res  ' + res.toFixed(2),              1);
 }
 
 /* -------------------------------------------------------------------------
- * Utility: frequency → nearest note name
+ * Utility
  * ---------------------------------------------------------------------- */
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 

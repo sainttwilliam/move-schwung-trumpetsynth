@@ -19,7 +19,7 @@ cd "$REPO_ROOT"
 MODULE_ID="trumpet-synth"
 MOVE_HOST="${MOVE_HOST:-move.local}"
 MOVE_USER="${MOVE_USER:-ableton}"
-MOVE_MODULES_DIR="/data/UserData/schwung/modules"
+MOVE_MODULES_DIR="/data/UserData/schwung/modules/audio_fx"
 DIST_DIR="dist/${MODULE_ID}"
 
 # ---------------------------------------------------------------------------
@@ -57,11 +57,16 @@ ssh "${MOVE_USER}@${MOVE_HOST}" \
     "mkdir -p '${MOVE_MODULES_DIR}/${MODULE_ID}'"
 
 echo "Copying module files..."
-scp -p "${DIST_DIR}/module.json"  "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
-scp -p "${DIST_DIR}/ui.js"        "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
-scp -p "${DIST_DIR}/ui_chain.js"  "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
-scp -p "${DIST_DIR}/help.json"    "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
-scp -p "${DIST_DIR}/trumpet-synth.so" "${MOVE_USER}@${MOVE_HOST}:${MOVE_MODULES_DIR}/${MODULE_ID}/"
+# Pack the entire dist dir and unpack on the device in one connection.
+# This avoids partial deploys from individual scp calls failing silently.
+tar -C "${DIST_DIR}" -cf - . \
+    | ssh "${MOVE_USER}@${MOVE_HOST}" \
+          "tar -C '${MOVE_MODULES_DIR}/${MODULE_ID}' -xf -"
+
+echo "Enforcing component_type=audio_fx in module.json..."
+ssh "${MOVE_USER}@${MOVE_HOST}" \
+    "sed -i 's/\"component_type\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"component_type\": \"audio_fx\"/' \
+     '${MOVE_MODULES_DIR}/${MODULE_ID}/module.json'"
 
 echo "Setting permissions..."
 ssh "${MOVE_USER}@${MOVE_HOST}" \

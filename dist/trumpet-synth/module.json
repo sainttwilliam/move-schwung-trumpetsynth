@@ -1,68 +1,76 @@
 {
   "id": "trumpet-synth",
   "name": "Trumpet Synth",
-  "version": "0.1.0",
-  "api_version": 2,
-  "description": "Monophonic pitch-tracking synthesizer driven by trumpet audio input via Roland Silent Brass. Input is protected by a hard limiter and soft compressor before aubio pitch detection. Synthesizes audio with an oscillator, ADSR, and Airwindows Capacitor filter.",
-  "author": "andrewcolman",
   "abbrev": "TrSyn",
+  "version": "0.4.0",
+  "description": "Pitch-tracking synthesizer. Audio in → autocorrelation pitch detection → oscillator → output.",
+  "author": "andrewcolman",
+  "dsp": "trumpet-synth.so",
   "ui": "ui.js",
-  "dsp": "dsp.so",
   "ui_chain": "ui_chain.js",
+  "api_version": 2,
   "capabilities": {
-    "audio_out": true,
-    "audio_in": true,
     "chainable": true,
-    "component_type": "audio_fx"
-  },
-  "ui_hierarchy": {
-    "levels": [
-      {
-        "name": "Input",
-        "params": [
-          { "key": "input_gain",       "name": "Input Gain",     "type": "float", "min": 0.0, "max": 4.0, "default": 1.0 },
-          { "key": "pitch_confidence", "name": "Min Confidence", "type": "float", "min": 0.0, "max": 1.0, "default": 0.8 },
-          { "key": "pitch_smooth",     "name": "Pitch Smooth",   "type": "float", "min": 0.0, "max": 1.0, "default": 0.05 }
-        ]
-      },
-      {
-        "name": "Compressor",
-        "params": [
-          { "key": "comp_threshold", "name": "Threshold", "type": "float", "min": 0.1,  "max": 1.0,  "default": 0.8 },
-          { "key": "comp_ratio",     "name": "Ratio",     "type": "float", "min": 1.0,  "max": 20.0, "default": 4.0 },
-          { "key": "comp_makeup",    "name": "Makeup",    "type": "float", "min": 0.0,  "max": 4.0,  "default": 1.0 }
-        ]
-      },
-      {
-        "name": "Oscillator",
-        "params": [
-          { "key": "osc_wave",   "name": "Waveform", "type": "enum",  "values": ["sine", "triangle", "saw", "square"], "default": "saw" },
-          { "key": "osc_detune", "name": "Detune",   "type": "float", "min": -100.0, "max": 100.0, "default": 0.0 },
-          { "key": "osc_level",  "name": "Level",    "type": "float", "min": 0.0,   "max": 1.0,   "default": 0.8 }
-        ]
-      },
-      {
-        "name": "Envelope",
-        "params": [
-          { "key": "env_attack",  "name": "Attack",  "type": "float", "min": 0.001, "max": 2.0, "default": 0.01 },
-          { "key": "env_decay",   "name": "Decay",   "type": "float", "min": 0.001, "max": 2.0, "default": 0.1  },
-          { "key": "env_sustain", "name": "Sustain", "type": "float", "min": 0.0,   "max": 1.0, "default": 0.7  },
-          { "key": "env_release", "name": "Release", "type": "float", "min": 0.001, "max": 4.0, "default": 0.2  }
-        ]
-      },
-      {
-        "name": "Filter",
-        "params": [
-          { "key": "filter_cutoff", "name": "Cutoff",    "type": "float", "min": 20.0, "max": 20000.0, "default": 4000.0 },
-          { "key": "filter_reso",   "name": "Resonance", "type": "float", "min": 0.0,  "max": 1.0,     "default": 0.3    }
-        ]
-      },
-      {
-        "name": "Output",
-        "params": [
-          { "key": "volume", "name": "Volume", "type": "float", "min": 0.0, "max": 1.0, "default": 0.8 }
-        ]
+    "component_type": "audio_fx",
+    "ui_hierarchy": {
+      "modes": null,
+      "levels": {
+        "root": {
+          "name": "Trumpet Synth",
+          "knobs": [
+            "gate_threshold",
+            "filter_cutoff",
+            "filter_resonance",
+            "volume"
+          ],
+          "params": [
+            { "level": "Input",      "label": "Input"      },
+            { "level": "Oscillator", "label": "Oscillator" },
+            { "level": "Filter",     "label": "Filter"     }
+          ]
+        },
+        "Input": {
+          "label": "Input",
+          "knobs": [
+            "gate_threshold",
+            "pitch_smooth",
+            "input_gain",
+            "pitch_confidence"
+          ],
+          "params": [
+            { "key": "input_gain",       "label": "Input Gain",  "type": "float", "min": 0.0, "max": 4.0,  "default": 1.0,   "step": 0.01 },
+            { "key": "gate_threshold",   "label": "Gate",        "type": "float", "min": 0.0, "max": 0.1,  "default": 0.007, "step": 0.001 },
+            { "key": "pitch_confidence", "label": "Confidence",  "type": "float", "min": 0.0, "max": 1.0,  "default": 0.0,   "step": 0.01 },
+            { "key": "pitch_smooth",     "label": "Pitch Smooth","type": "float", "min": 0.0, "max": 1.0,  "default": 0.005, "step": 0.005 }
+          ]
+        },
+        "Oscillator": {
+          "label": "Oscillator",
+          "knobs": [
+            "osc_wave",
+            "osc_detune",
+            "osc_level",
+            "volume"
+          ],
+          "params": [
+            { "key": "osc_wave",   "label": "Waveform", "type": "enum",  "options": ["sine", "triangle", "saw", "square"], "default": 0 },
+            { "key": "osc_detune", "label": "Detune",   "type": "float", "min": -100.0, "max": 100.0, "default": 0.0, "step": 1.0, "unit": "ct" },
+            { "key": "osc_level",  "label": "Level",    "type": "float", "min": 0.0,    "max": 1.0,   "default": 0.8, "step": 0.01 },
+            { "key": "volume",     "label": "Volume",   "type": "float", "min": 0.0,    "max": 1.0,   "default": 0.8, "step": 0.01 }
+          ]
+        },
+        "Filter": {
+          "label": "Filter",
+          "knobs": [
+            "filter_cutoff",
+            "filter_resonance"
+          ],
+          "params": [
+            { "key": "filter_cutoff",    "label": "Cutoff",    "type": "float", "min": 20.0, "max": 20000.0, "default": 2000.0, "step": 10.0, "unit": "Hz" },
+            { "key": "filter_resonance", "label": "Resonance", "type": "float", "min": 0.0,  "max": 1.0,     "default": 0.3,    "step": 0.01 }
+          ]
+        }
       }
-    ]
+    }
   }
 }
