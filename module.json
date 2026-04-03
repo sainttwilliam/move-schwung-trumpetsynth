@@ -53,7 +53,7 @@
             "volume"
           ],
           "params": [
-            { "key": "osc_wave",   "label": "Waveform", "type": "enum",  "options": ["sine", "triangle", "saw", "square"], "default": 0 },
+            { "key": "osc_wave",   "label": "Waveform", "type": "enum",  "options": ["sine", "triangle", "saw", "square"], "default": 2 },
             { "key": "osc_detune", "label": "Detune",   "type": "float", "min": -100.0, "max": 100.0, "default": 0.0, "step": 1.0, "unit": "ct" },
             { "key": "osc_level",  "label": "Level",    "type": "float", "min": 0.0,    "max": 1.0,   "default": 0.8, "step": 0.01 },
             { "key": "volume",     "label": "Volume",   "type": "float", "min": 0.0,    "max": 1.0,   "default": 0.8, "step": 0.01 }
@@ -66,7 +66,7 @@
             "filter_resonance"
           ],
           "params": [
-            { "key": "filter_cutoff",    "label": "Cutoff",    "type": "float", "min": 20.0, "max": 20000.0, "default": 2000.0, "step": 10.0, "unit": "Hz" },
+            { "key": "filter_cutoff",    "label": "Cutoff",    "type": "float", "min": 20.0, "max": 20000.0, "default": 20000.0, "step": 10.0, "unit": "Hz" },
             { "key": "filter_resonance", "label": "Resonance", "type": "float", "min": 0.0,  "max": 1.0,     "default": 0.3,    "step": 0.01 }
           ]
         }

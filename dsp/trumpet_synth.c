@@ -23,8 +23,8 @@
 #define BLOCK_SIZE   128
 #define PITCH_WIN    2048   /* analysis window (~46ms at 44100 Hz)                       */
 #define PITCH_HOP    512    /* new samples per pitch detection call                       */
-#define GATE_ATTACK_RATE  (1.0f / (0.005f * SAMPLE_RATE))  /* 5ms open ramp  */
-#define GATE_RELEASE_RATE (1.0f / (0.005f * SAMPLE_RATE))  /* 5ms close ramp */
+#define GATE_ATTACK_RATE     (1.0f / (0.001f * SAMPLE_RATE))  /* 1ms open ramp         */
+#define GATE_RELEASE_SAMPLES ((int)(0.008f * SAMPLE_RATE))     /* 8ms release countdown */
 #define AC_MIN_LAG   32     /* 44100 / 1378 Hz ≈ 32.0 — first lag above 1378 Hz          */
 #define AC_MAX_LAG   294    /* 44100 /  150 Hz = 294.0 — last lag above 150 Hz           */
 #define AC_SIEVE_MIN  8     /* AC_MIN_LAG / 4 — lowest lag computed (for sieve lookups)  */
@@ -62,16 +62,20 @@ typedef struct {
     smpl_t hop_buf[PITCH_HOP]; /* accumulator: fills at BLOCK_SIZE rate */
     int    hop_fill;           /* samples currently in hop_buf          */
 
-    float  raw_hz_buf[5];     /* circular buffer of last 5 processed hz */
+    float  raw_hz_buf[3];     /* circular buffer of last 3 processed hz */
     int    raw_hz_idx;        /* next write position                    */
-    int    raw_hz_count;      /* number of valid entries (max 5)        */
+    int    raw_hz_count;      /* number of valid entries (max 3)        */
 
     float     osc_phase;
-    float     gate_gain;         /* smoothed gate: ramps 0→1 on open, 1→0 on close  */
-    int       onset_pending;     /* set on gate open; cleared after first valid pitch */
-    float     last_rms;          /* RMS of previous block — used for pitch freeze     */
-    float     frozen_hz;         /* smoothed_hz captured at gate close                */
-    int       gate_closed_samples; /* frames elapsed since gate closed               */
+    float     gate_gain;          /* smoothed gate: ramps 0→1 on open, 1→0 on close  */
+    int       onset_pending;      /* set on gate open; cleared after first valid pitch */
+    float     last_rms;           /* RMS of previous block — used for pitch freeze     */
+    float     frozen_hz;          /* smoothed_hz captured at gate close                */
+    int       gate_closed_samples; /* frames elapsed since gate closed                */
+    int       gate_release_count;  /* countdown samples remaining in release ramp      */
+    int       attack_blind_blocks; /* blocks to suppress pitch after gate open         */
+    int       slur_change_count;   /* consecutive hops with >20% pitch jump            */
+    int       pitch_stable_blocks; /* hops since last detected_hz commit               */
     Capacitor filter;
 
     Params p;
@@ -101,36 +105,44 @@ static void params_init_defaults(Params *p) {
     p->pitch_confidence = 0.0f;
     p->pitch_smooth     = 0.005f;
     p->gate_threshold   = 0.007f; /* RMS ~-43 dBFS */
-    p->osc_wave         = 0;
+    p->osc_wave         = 2;
     p->osc_detune       = 0.0f;
     p->osc_level        = 0.8f;
     p->volume           = 0.8f;
-    p->filter_cutoff    = 2000.0f;
+    p->filter_cutoff    = 20000.0f;
     p->filter_resonance = 0.3f;
 }
 
 /* -------------------------------------------------------------------------
- * Persistence filter: groups readings within a 2:1 ratio as the same note
- * (covers octave alternation). If 3+ readings agree, returns the highest
- * value in that group — biasing toward the upper octave, which is correct
- * for trumpet. Returns prev_hz unchanged if fewer than 3 agree.
+ * Persistence filter: requires 2-out-of-3 readings within 15% of each other.
+ * Frequencies are treated as independent — no octave grouping. 349 Hz and
+ * 698 Hz are different pitches and will not match. This is safe because the
+ * custom autocorrelation + harmonic sieve already rejects sub-octave errors;
+ * the 2:1 grouping previously caused F4/F5 slurs to lock to the lower octave.
+ * Returns prev_hz unchanged if no pair agrees within 15%.
  * ---------------------------------------------------------------------- */
 static float persistence_filter(const float *buf, int n, float prev_hz) {
     int   best_count = 0;
-    float best_max   = 0.0f;
+    float best_hz    = 0.0f;
     for (int i = 0; i < n; i++) {
-        int   count = 0;
-        float grp_max = 0.0f;
+        if (buf[i] <= 0.0f) continue;
+        int   count   = 0;
+        float grp_rep = buf[i];
         for (int j = 0; j < n; j++) {
-            float ratio = buf[i] > buf[j] ? buf[i] / buf[j] : buf[j] / buf[i];
-            if (ratio <= 2.0f) {
+            if (buf[j] <= 0.0f) continue;
+            float lo    = buf[i] < buf[j] ? buf[i] : buf[j];
+            float hi    = buf[i] > buf[j] ? buf[i] : buf[j];
+            float ratio = hi / lo;
+            int agree = (ratio <= 1.15f) ||
+                        (lo < 200.0f && hi > 200.0f);
+            if (agree) {
                 count++;
-                if (buf[j] > grp_max) grp_max = buf[j];
+                if (buf[j] > grp_rep) grp_rep = buf[j];
             }
         }
-        if (count > best_count) { best_count = count; best_max = grp_max; }
+        if (count > best_count) { best_count = count; best_hz = grp_rep; }
     }
-    return (best_count >= 3) ? best_max : prev_hz;
+    return (best_count >= 2) ? best_hz : prev_hz;
 }
 
 /* -------------------------------------------------------------------------
@@ -328,65 +340,115 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
 
             float hz = autocorr_pitch(s->pitch_buf->data, PITCH_WIN);
 
-            /* Only update pitch when signal is clearly present (≥ 50% of gate
-             * threshold). Below that the detector loses lock and would produce
-             * octave jumps as the note decays — hold last stable value instead. */
-            if (hz > 0.0f && s->last_rms >= p->gate_threshold * 0.5f) {
-                /* Store in circular buffer */
+            /* Only update pitch when: gate is open, signal is present (≥ 50% of
+             * gate threshold), and attack blind period has elapsed.
+             * Gate close freezes detected_hz immediately — no pitch drift on release. */
+            if (hz > 0.0f && s->gate
+                          && s->last_rms >= p->gate_threshold * 0.5f
+                          && s->attack_blind_blocks == 0) {
+
+                /* Step 1: double up to 6 times to bring above 180 Hz */
+                for (int oct = 0; oct < 6 && hz < 180.0f; oct++) hz *= 2.0f;
+                /* Step 2: halve once if above 700 Hz */
+                if (hz > 700.0f) hz *= 0.5f;
+                /* Step 3: flywheel — reject if candidate is ~2x from smoothed_hz
+                 * (ratio within 15% of 2.0). Active only for the first 5 hops after
+                 * a pitch commit; after 5 hops of stable persistence agreement the
+                 * persistence filter is the final authority and flywheel is bypassed. */
+                if (hz > 0.0f && s->smoothed_hz > 0.0f && s->pitch_stable_blocks < 5) {
+                    float lo = hz < s->smoothed_hz ? hz : s->smoothed_hz;
+                    float hi = hz > s->smoothed_hz ? hz : s->smoothed_hz;
+                    float ratio = hi / lo;
+                    if (ratio > 1.70f && ratio < 2.30f)
+                        hz = 0.0f;
+                }
+                /* Step 4: accept only 155–760 Hz, else hold previous */
+                if (hz < 155.0f || hz > 760.0f) hz = 0.0f;
+            }
+
+            if (hz > 0.0f && s->gate && s->attack_blind_blocks == 0) {
+                /* Store in 3-slot circular buffer */
                 s->raw_hz_buf[s->raw_hz_idx] = hz;
-                s->raw_hz_idx = (s->raw_hz_idx + 1) % 5;
-                if (s->raw_hz_count < 5) s->raw_hz_count++;
+                s->raw_hz_idx = (s->raw_hz_idx + 1) % 3;
+                if (s->raw_hz_count < 3) s->raw_hz_count++;
 
                 if (s->onset_pending) {
                     /* First valid reading after a note attack — commit immediately */
-                    s->detected_hz   = hz;
-                    s->smoothed_hz   = hz;  /* also snap smoother to avoid glide-in */
-                    s->onset_pending = 0;
+                    s->detected_hz        = hz;
+                    s->smoothed_hz        = hz;
+                    s->onset_pending      = 0;
+                    s->slur_change_count  = 0;
+                    s->pitch_stable_blocks = 0;
                 } else {
-                    s->detected_hz = persistence_filter(
+                    /* Slur detection: >20% deviation for 3 consecutive hops while
+                     * gate stays open → snap to new pitch, reset persistence. */
+                    if (s->smoothed_hz > 0.0f) {
+                        float lo = hz < s->smoothed_hz ? hz : s->smoothed_hz;
+                        float hi = hz > s->smoothed_hz ? hz : s->smoothed_hz;
+                        if (lo > 0.0f && (hi / lo) > 1.20f) {
+                            s->slur_change_count++;
+                            if (s->slur_change_count >= 3) {
+                                s->raw_hz_buf[0] = hz;
+                                s->raw_hz_buf[1] = 0.0f;
+                                s->raw_hz_buf[2] = 0.0f;
+                                s->raw_hz_idx    = 1;
+                                s->raw_hz_count  = 1;
+                                s->detected_hz    = hz;
+                                s->smoothed_hz    = hz;
+                                s->frozen_hz      = 0.0f;
+                                s->slur_change_count  = 0;
+                                s->pitch_stable_blocks = 0;
+                            }
+                        } else {
+                            s->slur_change_count = 0;
+                        }
+                    }
+                    /* Persistence filter: 2-of-3 readings within 15% required */
+                    float candidate = persistence_filter(
                         s->raw_hz_buf, s->raw_hz_count, s->detected_hz);
+                    if (candidate != s->detected_hz) {
+                        s->detected_hz         = candidate;
+                        s->pitch_stable_blocks  = 0;
+                    } else {
+                        if (s->pitch_stable_blocks < 5) s->pitch_stable_blocks++;
+                    }
                 }
             }
-            /* else hz=0.0: autocorr found no valid peak — hold detected_hz unchanged */
-
-            if (s->block_count % 10 == 0) {
-                FILE *f = fopen("/data/UserData/tsyn_debug.log", "a");
-                if (f) {
-                    fprintf(f, "[tsyn] hz=%.1f gate=%d rms=%.4f\n",
-                            hz, s->gate, sqrtf(sum_sq / (i + 1)));
-                    fclose(f);
-                }
-            }
+            /* else: hold detected_hz unchanged (no peak, gate closed, or blind) */
         }
     }
     float rms = sqrtf(sum_sq / frames);
     s->last_rms = rms;
 
-    /* Amplitude gate: open at threshold, 20ms minimum hold, close at 30% of threshold */
+    /* Decrement attack blind period counter once per block */
+    if (s->attack_blind_blocks > 0) s->attack_blind_blocks--;
+
+    /* Amplitude gate: open at threshold, 30ms minimum hold, close at 30% of threshold */
     if (!s->gate && rms >= p->gate_threshold) {
-        /* If the gate reopens within 200ms, snap the pitch smoother to the frozen
-         * value from the previous note so tonguing doesn't scoop up from a drifted hz. */
-        if (s->gate_closed_samples < (int)(SAMPLE_RATE * 0.200f) && s->frozen_hz > 0.0f) {
+        /* Quick re-articulation (< 50ms gap): restore frozen pitch so the oscillator
+         * plays the correct pitch immediately while waiting for first onset detection.
+         * Longer gaps: let onset_pending commit the first autocorr reading instead. */
+        if (s->gate_closed_samples < (int)(SAMPLE_RATE * 0.050f) && s->frozen_hz > 0.0f) {
             s->smoothed_hz = s->frozen_hz;
             s->detected_hz = s->frozen_hz;
         }
         s->gate = 1;
-        s->gate_hold_remaining   = (int)(SAMPLE_RATE * 0.020f);
-        s->gate_closed_samples   = 0;
-        /* Reset persistence buffer so next valid reading commits immediately */
-        s->raw_hz_count  = 0;
-        s->raw_hz_idx    = 0;
-        s->onset_pending = 1;
+        s->gate_hold_remaining  = (int)(SAMPLE_RATE * 0.030f);
+        s->gate_closed_samples  = 0;
+        s->raw_hz_count         = 0;
+        s->raw_hz_idx           = 0;
+        s->onset_pending        = 1;
+        s->attack_blind_blocks  = 3;
+        s->slur_change_count    = 0;
     } else if (s->gate) {
         if (s->gate_hold_remaining > 0)
             s->gate_hold_remaining -= frames;
         else if (rms < p->gate_threshold * 0.3f) {
             s->gate = 0;
-            s->frozen_hz          = s->smoothed_hz;  /* lock last stable pitch */
+            s->frozen_hz           = s->smoothed_hz;
             s->gate_closed_samples = 0;
         }
     } else {
-        /* Gate remains closed — count elapsed samples for the 200ms window */
         s->gate_closed_samples += frames;
     }
 
@@ -395,23 +457,34 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
 
     /* Synthesise — oscillator always runs to avoid phase discontinuities */
     for (int i = 0; i < frames; i++) {
-        /* Only track pitch while gate is open — freeze frequency on release
-         * so the smoother doesn't drift (scoop) during the gain ramp-down. */
-        if (s->gate)
+        /* Smoother only runs while gate is open and past the onset commit */
+        if (s->gate && !s->onset_pending)
             s->smoothed_hz += k * (s->detected_hz - s->smoothed_hz);
-        /* Ramp gate_gain toward target to eliminate onset/release clicks */
+
+        /* Gate gain: 1ms linear attack; 8ms exact countdown release.
+         * Ramps immediately on gate open regardless of attack blind period —
+         * volume responds instantly while pitch detection is still suppressed. */
         if (s->gate) {
             s->gate_gain += GATE_ATTACK_RATE;
             if (s->gate_gain > 1.0f) s->gate_gain = 1.0f;
+            s->gate_release_count = GATE_RELEASE_SAMPLES;
+        } else if (s->gate_release_count > 0) {
+            s->gate_release_count--;
+            s->gate_gain = (float)s->gate_release_count / (float)GATE_RELEASE_SAMPLES;
         } else {
-            s->gate_gain -= GATE_RELEASE_RATE;
-            if (s->gate_gain < 0.0f) s->gate_gain = 0.0f;
+            s->gate_gain = 0.0f;
         }
 
         float freq     = s->smoothed_hz * powf(2.0f, p->osc_detune / 1200.0f);
         float osc      = osc_tick(s, freq) * p->osc_level * p->volume;
         float filtered = capacitor_process(&s->filter, osc, p->filter_resonance);
-        int16_t sample = (int16_t)(filtered * s->gate_gain * 32767.0f);
+
+        /* tanh soft limiter before int16 conversion — prevents clipping from
+         * filter resonance overshoot while preserving transient character */
+        float out = tanhf(filtered * 1.2f) * 0.85f;
+        out *= s->gate_gain;
+
+        int16_t sample = (int16_t)(out * 32767.0f);
         audio_inout[i * 2 + 0] = sample;
         audio_inout[i * 2 + 1] = sample;
     }
