@@ -17,7 +17,7 @@
 
 #include "host/plugin_api_v1.h"
 #include "host/audio_fx_api_v2.h"
-#include "capacitor.h"
+#include "dattorro_filter.h"
 
 #define SAMPLE_RATE  44100.0f
 #define BLOCK_SIZE   128
@@ -25,9 +25,8 @@
 #define PITCH_HOP    512    /* new samples per pitch detection call                       */
 #define GATE_ATTACK_RATE     (1.0f / (0.001f * SAMPLE_RATE))  /* 1ms open ramp         */
 #define GATE_RELEASE_SAMPLES ((int)(0.008f * SAMPLE_RATE))     /* 8ms release countdown */
-#define AC_MIN_LAG   32     /* 44100 / 1378 Hz ≈ 32.0 — first lag above 1378 Hz          */
+#define AC_MIN_LAG   28     /* 44100 / 1575 Hz ≈ 28.0 — first lag above 1575 Hz          */
 #define AC_MAX_LAG   294    /* 44100 /  150 Hz = 294.0 — last lag above 150 Hz           */
-#define AC_SIEVE_MIN  8     /* AC_MIN_LAG / 4 — lowest lag computed (for sieve lookups)  */
 
 /* -------------------------------------------------------------------------
  * Parameters
@@ -76,9 +75,10 @@ typedef struct {
     int       gate_release_count;  /* countdown samples remaining in release ramp      */
     int       attack_blind_blocks; /* blocks to suppress pitch after gate open         */
     int       slur_change_count;   /* consecutive hops with >20% pitch jump            */
-    int       pitch_stable_blocks; /* hops since last detected_hz commit               */
+    float     last_raw_hz;         /* raw autocorr result before any correction        */
+    int       log_committed;       /* 1 if detected_hz changed this block              */
     float     vol_rms_smooth;      /* 15ms smoothed RMS for volume tracking            */
-    Capacitor filter;
+    DattorroFilter filter;
 
     Params p;
 } TrumpetSynth;
@@ -106,7 +106,7 @@ static void params_init_defaults(Params *p) {
     p->input_gain       = 1.0f;
     p->pitch_confidence = 0.0f;
     p->pitch_smooth     = 0.005f;
-    p->gate_threshold   = 0.007f; /* RMS ~-43 dBFS */
+    p->gate_threshold   = 0.015f; /* RMS ~-36 dBFS — tuned for Roland Silent Brass levels */
     p->osc_wave         = 2;
     p->osc_detune       = 0.0f;
     p->osc_level        = 0.8f;
@@ -136,8 +136,7 @@ static float persistence_filter(const float *buf, int n, float prev_hz) {
             float lo    = buf[i] < buf[j] ? buf[i] : buf[j];
             float hi    = buf[i] > buf[j] ? buf[i] : buf[j];
             float ratio = hi / lo;
-            int agree = (ratio <= 1.15f) ||
-                        (lo < 200.0f && hi > 200.0f);
+            int agree = (ratio <= 1.15f);
             if (agree) {
                 count++;
                 if (buf[j] > grp_rep) grp_rep = buf[j];
@@ -167,8 +166,8 @@ static void *plugin_create(const char *module_dir, const char *json_defaults) {
         free(s);
         return NULL;
     }
-    capacitor_init(&s->filter);
-    capacitor_set_cutoff(&s->filter, s->p.filter_cutoff, SAMPLE_RATE);
+    dattorro_init(&s->filter);
+    dattorro_set_params(&s->filter, s->p.filter_cutoff, s->p.filter_resonance, SAMPLE_RATE);
 
     return s;
 }
@@ -197,9 +196,12 @@ static void plugin_set_param(void *instance, const char *key, const char *val) {
     else if (strcmp(key, "volume")           == 0) p->volume           = parse_float(val, p->volume);
     else if (strcmp(key, "filter_cutoff")    == 0) {
         p->filter_cutoff = parse_float(val, p->filter_cutoff);
-        capacitor_set_cutoff(&s->filter, p->filter_cutoff, SAMPLE_RATE);
+        dattorro_set_params(&s->filter, p->filter_cutoff, p->filter_resonance, SAMPLE_RATE);
     }
-    else if (strcmp(key, "filter_resonance") == 0) p->filter_resonance = parse_float(val, p->filter_resonance);
+    else if (strcmp(key, "filter_resonance") == 0) {
+        p->filter_resonance = parse_float(val, p->filter_resonance);
+        dattorro_set_params(&s->filter, p->filter_cutoff, p->filter_resonance, SAMPLE_RATE);
+    }
     else if (strcmp(key, "vol_tracking")     == 0) p->vol_tracking     = parse_float(val, p->vol_tracking);
 }
 
@@ -250,20 +252,29 @@ static void plugin_on_midi(void *instance, const uint8_t *msg, int len, int sour
  * stronger peak: if so, this lag is a sub-harmonic and is rejected.
  * Returns the detected frequency in Hz, or 0.0f on silence/no peak.
  * ---------------------------------------------------------------------- */
-static float autocorr_pitch(const smpl_t *buf, int win) {
+static float autocorr_pitch(const smpl_t *buf, int win, float rms) {
     float r0 = 0.0f;
     for (int i = 0; i < win; i++) r0 += buf[i] * buf[i];
     if (r0 < 1e-6f) return 0.0f;
 
-    /* Autocorrelation for lags needed by both the search range and the sieve */
+    /* Autocorrelation for lags AC_MIN_LAG-1 through AC_MAX_LAG.
+     * One lag below AC_MIN_LAG is computed so the local-maximum check
+     * at the first candidate lag has a valid left neighbour. */
     float r[AC_MAX_LAG + 1];
     memset(r, 0, sizeof(r));
-    for (int lag = AC_SIEVE_MIN; lag <= AC_MAX_LAG; lag++) {
+    for (int lag = AC_MIN_LAG - 1; lag <= AC_MAX_LAG; lag++) {
         float sum = 0.0f;
         int   n   = win - lag;
         for (int i = 0; i < n; i++) sum += buf[i] * buf[i + lag];
         r[lag] = sum / r0;
     }
+
+    /* Signal level through Roland Silent Brass is consistently 0.02–0.05 RMS —
+     * at these levels the ratio between fundamental and harmonic peaks is less
+     * pronounced, so use a strict sieve: a sub-peak needs only 50% of the
+     * candidate's strength to trigger rejection. */
+    float sieve_thresh = 0.5f;
+    (void)rms; /* sieve_thresh is now fixed; rms kept for gate guard above */
 
     float best_val = 0.1f;  /* minimum normalised autocorrelation to accept */
     int   best_lag = 0;
@@ -272,16 +283,16 @@ static float autocorr_pitch(const smpl_t *buf, int win) {
         /* Local maximum */
         if (r[lag] <= r[lag - 1] || r[lag] <= r[lag + 1]) continue;
 
-        /* Harmonic sieve: reject if any divisor lag has a stronger peak AND
-         * that divisor lag is itself within the valid search window [AC_MIN_LAG,
-         * AC_MAX_LAG]. Guarding with AC_MIN_LAG (not AC_SIEVE_MIN) prevents
-         * instrument harmonic energy above the search range (e.g. r[31] for a
-         * 700 Hz note) from incorrectly triggering rejection of true fundamentals
-         * in the 650–980 Hz range. */
+        /* Harmonic sieve: prefer fundamentals over harmonics.
+         * If a longer lag (lower frequency) — lag*2, lag*3, or lag*4 —
+         * has a strong peak within the search range, this candidate is
+         * a harmonic of that lower note. Skip it so the fundamental wins.
+         * Example: lag 62 (F5=711Hz) is skipped when lag 124 (F4=356Hz)
+         * is strong, allowing lag 124 to win as the true fundamental. */
         int rejected = 0;
-        for (int div = 2; div <= 4 && !rejected; div++) {
-            int sub = lag / div;
-            if (sub >= AC_MIN_LAG && r[sub] > 0.6f * r[lag])
+        for (int mul = 2; mul <= 4 && !rejected; mul++) {
+            int longer = lag * mul;
+            if (longer <= AC_MAX_LAG && r[longer] > sieve_thresh * r[lag])
                 rejected = 1;
         }
         if (rejected) continue;
@@ -323,6 +334,8 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
     TrumpetSynth *s = (TrumpetSynth *)instance;
     Params       *p = &s->p;
 
+    s->log_committed = 0;
+
     /* Convert input to mono float; accumulate into hop buffer and compute RMS */
     float sum_sq = 0.0f;
     for (int i = 0; i < frames; i++) {
@@ -343,7 +356,8 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
             s->hop_fill = 0;
             s->block_count++;
 
-            float hz = autocorr_pitch(s->pitch_buf->data, PITCH_WIN);
+            float hz = autocorr_pitch(s->pitch_buf->data, PITCH_WIN, s->last_rms);
+            s->last_raw_hz = hz;
 
             /* Only update pitch when: gate is open, signal is present (≥ 50% of
              * gate threshold), and attack blind period has elapsed.
@@ -352,72 +366,82 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
                           && s->last_rms >= p->gate_threshold * 0.5f
                           && s->attack_blind_blocks == 0) {
 
-                /* Step 1: double up to 6 times to bring above 180 Hz */
-                for (int oct = 0; oct < 6 && hz < 180.0f; oct++) hz *= 2.0f;
-                /* Step 2: halve once if above 700 Hz */
-                if (hz > 700.0f) hz *= 0.5f;
-                /* Step 3: flywheel — reject if candidate is ~2x from smoothed_hz
-                 * (ratio within 15% of 2.0). Active only for the first 5 hops after
-                 * a pitch commit; after 5 hops of stable persistence agreement the
-                 * persistence filter is the final authority and flywheel is bypassed. */
-                if (hz > 0.0f && s->smoothed_hz > 0.0f && s->pitch_stable_blocks < 5) {
-                    float lo = hz < s->smoothed_hz ? hz : s->smoothed_hz;
-                    float hi = hz > s->smoothed_hz ? hz : s->smoothed_hz;
-                    float ratio = hi / lo;
-                    if (ratio > 1.70f && ratio < 2.30f)
-                        hz = 0.0f;
-                }
-                /* Step 4: accept only 155–760 Hz, else hold previous */
-                if (hz < 155.0f || hz > 760.0f) hz = 0.0f;
-            }
-
-            if (hz > 0.0f && s->gate && s->attack_blind_blocks == 0) {
-                /* Store in 3-slot circular buffer */
+                /* Store RAW autocorrelation value in the persistence buffer.
+                 * Octave correction is applied AFTER persistence commits —
+                 * this keeps the 3-slot buffer free of artificially doubled
+                 * values that would otherwise corrupt the 2-of-3 matching. */
                 s->raw_hz_buf[s->raw_hz_idx] = hz;
                 s->raw_hz_idx = (s->raw_hz_idx + 1) % 3;
                 if (s->raw_hz_count < 3) s->raw_hz_count++;
 
+                /* Compute octave-corrected value for this single hop so that
+                 * slur detection and onset commits compare on the same scale
+                 * as smoothed_hz (which is always a corrected, committed value). */
+                /* Octave correction: only double values genuinely below the valid
+                 * range (<155Hz). Values already in 155–760Hz are used directly —
+                 * the sieve has already selected the correct fundamental. */
+                float hz_corr = hz;
+                while (hz_corr > 0.0f && hz_corr < 155.0f) hz_corr *= 2.0f;
+                if (hz_corr > 760.0f) hz_corr *= 0.5f;
+                int hz_corr_valid = (hz_corr >= 155.0f && hz_corr <= 760.0f);
+
                 if (s->onset_pending) {
-                    /* First valid reading after a note attack — commit immediately */
-                    s->detected_hz        = hz;
-                    s->smoothed_hz        = hz;
-                    s->onset_pending      = 0;
-                    s->slur_change_count  = 0;
-                    s->pitch_stable_blocks = 0;
+                    /* First valid reading after a note attack — commit immediately. */
+                    if (hz_corr_valid) {
+                        s->detected_hz       = hz_corr;
+                        s->smoothed_hz       = hz_corr;
+                        s->onset_pending     = 0;
+                        s->slur_change_count = 0;
+                        s->log_committed     = 1;
+                    }
                 } else {
-                    /* Slur detection: >20% deviation for 3 consecutive hops while
-                     * gate stays open → snap to new pitch, reset persistence. */
-                    if (s->smoothed_hz > 0.0f) {
-                        float lo = hz < s->smoothed_hz ? hz : s->smoothed_hz;
-                        float hi = hz > s->smoothed_hz ? hz : s->smoothed_hz;
+                    /* Slur detection: compare corrected per-hop value against
+                     * smoothed_hz (which is always corrected). >20% deviation
+                     * for 3 consecutive hops → snap to new pitch, reset buffer. */
+                    if (s->smoothed_hz > 0.0f && hz_corr_valid) {
+                        float lo = hz_corr < s->smoothed_hz ? hz_corr : s->smoothed_hz;
+                        float hi = hz_corr > s->smoothed_hz ? hz_corr : s->smoothed_hz;
                         if (lo > 0.0f && (hi / lo) > 1.20f) {
                             s->slur_change_count++;
                             if (s->slur_change_count >= 3) {
+                                /* Reset buffer to just this raw reading */
                                 s->raw_hz_buf[0] = hz;
                                 s->raw_hz_buf[1] = 0.0f;
                                 s->raw_hz_buf[2] = 0.0f;
                                 s->raw_hz_idx    = 1;
                                 s->raw_hz_count  = 1;
-                                s->detected_hz    = hz;
-                                s->smoothed_hz    = hz;
-                                s->frozen_hz      = 0.0f;
-                                s->slur_change_count  = 0;
-                                s->pitch_stable_blocks = 0;
+                                s->detected_hz       = hz_corr;
+                                s->smoothed_hz       = hz_corr;
+                                s->frozen_hz         = 0.0f;
+                                s->slur_change_count = 0;
+                                s->log_committed     = 1;
                             }
                         } else {
                             s->slur_change_count = 0;
                         }
                     }
-                    /* Persistence filter: 2-of-3 readings within 15% required.
-                     * On commit snap smoothed_hz directly — no ramp across transitions. */
-                    float candidate = persistence_filter(
+
+                    /* Persistence filter: 2-of-3 raw readings must agree within 15%. */
+                    float raw_candidate = persistence_filter(
                         s->raw_hz_buf, s->raw_hz_count, s->detected_hz);
-                    if (candidate != s->detected_hz) {
-                        s->detected_hz         = candidate;
-                        s->smoothed_hz         = candidate;
-                        s->pitch_stable_blocks  = 0;
-                    } else {
-                        if (s->pitch_stable_blocks < 5) s->pitch_stable_blocks++;
+
+                    /* Octave correction on the committed raw value. Only double
+                     * values below 155Hz — if the sieve returned a value already
+                     * in the valid range, use it directly without doubling. */
+                    float candidate = s->detected_hz;
+                    if (raw_candidate > 0.0f) {
+                        float c = raw_candidate;
+                        while (c > 0.0f && c < 155.0f) c *= 2.0f;
+                        if (c > 760.0f) c *= 0.5f;
+                        if (c >= 155.0f && c <= 760.0f) candidate = c;
+                    }
+
+                    /* Commit if corrected candidate differs from current pitch by > 1%. */
+                    if (s->detected_hz == 0.0f ||
+                            fabsf(candidate - s->detected_hz) / s->detected_hz > 0.01f) {
+                        s->detected_hz   = candidate;
+                        s->smoothed_hz   = candidate;
+                        s->log_committed = 1;
                     }
                 }
             }
@@ -472,6 +496,21 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
         s->gate_closed_samples += frames;
     }
 
+    /* Debug log — every block while gate is open */
+    if (s->gate) {
+        FILE *dbg = fopen("/data/UserData/tsyn_debug.log", "a");
+        if (dbg) {
+            fprintf(dbg,
+                "[tsyn] raw=%.1f buf=[%.1f,%.1f,%.1f] smooth=%.1f det=%.1f"
+                " rms=%.4f commit=%d blind=%d\n",
+                s->last_raw_hz,
+                s->raw_hz_buf[0], s->raw_hz_buf[1], s->raw_hz_buf[2],
+                s->smoothed_hz, s->detected_hz,
+                rms, s->log_committed, s->attack_blind_blocks);
+            fclose(dbg);
+        }
+    }
+
     /* Pitch smoother coefficient */
     const float k = 1.0f - expf(-1.0f / (SAMPLE_RATE * fmaxf(p->pitch_smooth, 1e-4f)));
 
@@ -497,7 +536,7 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
 
         float freq     = s->smoothed_hz * powf(2.0f, p->osc_detune / 1200.0f);
         float osc      = osc_tick(s, freq) * p->osc_level * dyn_vol;
-        float filtered = capacitor_process(&s->filter, osc, p->filter_resonance);
+        float filtered = dattorro_process(&s->filter, osc);
 
         /* tanh soft limiter before int16 conversion — prevents clipping from
          * filter resonance overshoot while preserving transient character */

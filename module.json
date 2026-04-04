@@ -39,7 +39,7 @@
           ],
           "params": [
             { "key": "input_gain",       "label": "Input Gain",  "type": "float", "min": 0.0, "max": 4.0,  "default": 1.0,   "step": 0.01 },
-            { "key": "gate_threshold",   "label": "Gate",        "type": "float", "min": 0.0, "max": 0.1,  "default": 0.007, "step": 0.001 },
+            { "key": "gate_threshold",   "label": "Gate",        "type": "float", "min": 0.0, "max": 0.1,  "default": 0.015, "step": 0.001 },
             { "key": "pitch_confidence", "label": "Confidence",  "type": "float", "min": 0.0, "max": 1.0,  "default": 0.0,   "step": 0.01 },
             { "key": "pitch_smooth",     "label": "Pitch Smooth","type": "float", "min": 0.0, "max": 1.0,  "default": 0.005, "step": 0.005 },
             { "key": "vol_tracking",     "label": "Vol Track",   "type": "float", "min": 0.0, "max": 1.0,  "default": 0.8,   "step": 0.01 }
