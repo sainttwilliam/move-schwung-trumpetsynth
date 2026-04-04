@@ -76,6 +76,7 @@ typedef struct {
     int       attack_blind_blocks; /* blocks to suppress pitch after gate open         */
     int       slur_change_count;   /* consecutive hops with >20% pitch jump            */
     float     last_raw_hz;         /* raw autocorr result before any correction        */
+    float     last_ac_delta;       /* parabolic interpolation delta from last hop       */
     int       log_committed;       /* 1 if detected_hz changed this block              */
     float     vol_rms_smooth;      /* 15ms smoothed RMS for volume tracking            */
     DattorroFilter filter;
@@ -252,7 +253,8 @@ static void plugin_on_midi(void *instance, const uint8_t *msg, int len, int sour
  * stronger peak: if so, this lag is a sub-harmonic and is rejected.
  * Returns the detected frequency in Hz, or 0.0f on silence/no peak.
  * ---------------------------------------------------------------------- */
-static float autocorr_pitch(const smpl_t *buf, int win, float rms) {
+static float autocorr_pitch(const smpl_t *buf, int win, float rms, float *out_delta) {
+    *out_delta = 0.0f;
     float r0 = 0.0f;
     for (int i = 0; i < win; i++) r0 += buf[i] * buf[i];
     if (r0 < 1e-6f) return 0.0f;
@@ -303,7 +305,20 @@ static float autocorr_pitch(const smpl_t *buf, int win, float rms) {
         }
     }
 
-    return (best_lag > 0) ? SAMPLE_RATE / (float)best_lag : 0.0f;
+    if (best_lag <= 0) return 0.0f;
+
+    /* Parabolic interpolation: fit a parabola through the three points
+     * around the peak to get a sub-integer lag estimate, reducing the
+     * quantisation error from integer-lag frequency steps. */
+    float denom = r[best_lag - 1] - 2.0f * r[best_lag] + r[best_lag + 1];
+    float delta = 0.0f;
+    if (denom < -1e-6f)   /* negative means true peak — safe to interpolate */
+        delta = 0.5f * (r[best_lag - 1] - r[best_lag + 1]) / denom;
+    if (delta >  0.45f) delta =  0.45f;
+    if (delta < -0.45f) delta = -0.45f;
+    *out_delta = delta;
+
+    return SAMPLE_RATE / (float)(best_lag + delta);
 }
 
 /* -------------------------------------------------------------------------
@@ -325,6 +340,34 @@ static inline float osc_tick(TrumpetSynth *s, float freq_hz) {
     if (s->osc_phase >= 1.0f) s->osc_phase -= 1.0f;
 
     return sample;
+}
+
+/* -------------------------------------------------------------------------
+ * Snap hz to nearest equal-temperament semitone (A4=440Hz) if within 15 cents.
+ * Eliminates the 304–310 Hz scatter from raw spread after octave doubling —
+ * all values within ±15 cents of Eb4 (311Hz) will land exactly on 311Hz.
+ * The 25-cent outer bound ensures we never make a large jump.
+ * ---------------------------------------------------------------------- */
+static float snap_to_semitone(float hz) {
+    if (hz <= 0.0f) return hz;
+    float midi_f  = 12.0f * log2f(hz / 440.0f) + 69.0f;
+    int   midi_i  = (int)roundf(midi_f);
+    float snapped = 440.0f * powf(2.0f, (float)(midi_i - 69) / 12.0f);
+    float cents   = fabsf(1200.0f * log2f(snapped / hz));
+    return (cents <= 15.0f && cents < 25.0f) ? snapped : hz;
+}
+
+/* -------------------------------------------------------------------------
+ * Hz → note name helper (A4=440Hz reference, flats on black keys)
+ * Writes at most 5 bytes (e.g. "Bb3\0") into buf.
+ * ---------------------------------------------------------------------- */
+static void hz_to_note(float hz, char *buf) {
+    static const char *names[] = { "C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B" };
+    if (hz <= 0.0f) { buf[0] = '-'; buf[1] = '-'; buf[2] = '-'; buf[3] = '\0'; return; }
+    int midi = (int)roundf(12.0f * log2f(hz / 440.0f) + 69.0f);
+    int idx  = ((midi % 12) + 12) % 12;
+    int oct  = midi / 12 - 1;
+    snprintf(buf, 6, "%s%d", names[idx], oct);
 }
 
 /* -------------------------------------------------------------------------
@@ -356,7 +399,7 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
             s->hop_fill = 0;
             s->block_count++;
 
-            float hz = autocorr_pitch(s->pitch_buf->data, PITCH_WIN, s->last_rms);
+            float hz = autocorr_pitch(s->pitch_buf->data, PITCH_WIN, s->last_rms, &s->last_ac_delta);
             s->last_raw_hz = hz;
 
             /* Only update pitch when: gate is open, signal is present (≥ 50% of
@@ -366,6 +409,31 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
                           && s->last_rms >= p->gate_threshold * 0.5f
                           && s->attack_blind_blocks == 0) {
 
+                /* Octave-correct this hop's value for comparison against smoothed_hz.
+                 * Must be computed before buffer insertion so we can use it for
+                 * the stale-buffer clear check below. */
+                float hz_corr = hz;
+                while (hz_corr > 0.0f && hz_corr < 195.0f) hz_corr *= 2.0f;
+                if (hz_corr > 760.0f) hz_corr *= 0.5f;
+                hz_corr = snap_to_semitone(hz_corr);
+                int hz_corr_valid = (hz_corr >= 195.0f && hz_corr <= 760.0f);
+
+                /* Stale-buffer clear: if the corrected reading differs from the
+                 * current output pitch by more than 20%, the note has changed.
+                 * Wipe the buffer before inserting so the new note starts fresh
+                 * rather than fighting stale slots from the previous note. */
+                if (hz_corr_valid && s->smoothed_hz > 0.0f) {
+                    float lo = hz_corr < s->smoothed_hz ? hz_corr : s->smoothed_hz;
+                    float hi = hz_corr > s->smoothed_hz ? hz_corr : s->smoothed_hz;
+                    if (hi / lo > 1.20f) {
+                        s->raw_hz_buf[0] = 0.0f;
+                        s->raw_hz_buf[1] = 0.0f;
+                        s->raw_hz_buf[2] = 0.0f;
+                        s->raw_hz_count  = 0;
+                        s->raw_hz_idx    = 0;
+                    }
+                }
+
                 /* Store RAW autocorrelation value in the persistence buffer.
                  * Octave correction is applied AFTER persistence commits —
                  * this keeps the 3-slot buffer free of artificially doubled
@@ -373,17 +441,6 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
                 s->raw_hz_buf[s->raw_hz_idx] = hz;
                 s->raw_hz_idx = (s->raw_hz_idx + 1) % 3;
                 if (s->raw_hz_count < 3) s->raw_hz_count++;
-
-                /* Compute octave-corrected value for this single hop so that
-                 * slur detection and onset commits compare on the same scale
-                 * as smoothed_hz (which is always a corrected, committed value). */
-                /* Octave correction: only double values genuinely below the valid
-                 * range (<155Hz). Values already in 155–760Hz are used directly —
-                 * the sieve has already selected the correct fundamental. */
-                float hz_corr = hz;
-                while (hz_corr > 0.0f && hz_corr < 155.0f) hz_corr *= 2.0f;
-                if (hz_corr > 760.0f) hz_corr *= 0.5f;
-                int hz_corr_valid = (hz_corr >= 155.0f && hz_corr <= 760.0f);
 
                 if (s->onset_pending) {
                     /* First valid reading after a note attack — commit immediately. */
@@ -431,14 +488,15 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
                     float candidate = s->detected_hz;
                     if (raw_candidate > 0.0f) {
                         float c = raw_candidate;
-                        while (c > 0.0f && c < 155.0f) c *= 2.0f;
+                        while (c > 0.0f && c < 195.0f) c *= 2.0f;
                         if (c > 760.0f) c *= 0.5f;
-                        if (c >= 155.0f && c <= 760.0f) candidate = c;
+                        c = snap_to_semitone(c);
+                        if (c >= 195.0f && c <= 760.0f) candidate = c;
                     }
 
-                    /* Commit if corrected candidate differs from current pitch by > 1%. */
+                    /* Commit if corrected candidate differs from current pitch by > 0.3%. */
                     if (s->detected_hz == 0.0f ||
-                            fabsf(candidate - s->detected_hz) / s->detected_hz > 0.01f) {
+                            fabsf(candidate - s->detected_hz) / s->detected_hz > 0.003f) {
                         s->detected_hz   = candidate;
                         s->smoothed_hz   = candidate;
                         s->log_committed = 1;
@@ -500,10 +558,14 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
     if (s->gate) {
         FILE *dbg = fopen("/data/UserData/tsyn_debug.log", "a");
         if (dbg) {
+            char in_note[6], out_note[6];
+            hz_to_note(s->last_raw_hz, in_note);
+            hz_to_note(s->smoothed_hz, out_note);
             fprintf(dbg,
-                "[tsyn] raw=%.1f buf=[%.1f,%.1f,%.1f] smooth=%.1f det=%.1f"
-                " rms=%.4f commit=%d blind=%d\n",
-                s->last_raw_hz,
+                "[tsyn] in=%s out=%s raw=%.1f delta=%.3f buf=[%.1f,%.1f,%.1f]"
+                " smooth=%.1f det=%.1f rms=%.4f commit=%d blind=%d\n",
+                in_note, out_note,
+                s->last_raw_hz, s->last_ac_delta,
                 s->raw_hz_buf[0], s->raw_hz_buf[1], s->raw_hz_buf[2],
                 s->smoothed_hz, s->detected_hz,
                 rms, s->log_committed, s->attack_blind_blocks);
