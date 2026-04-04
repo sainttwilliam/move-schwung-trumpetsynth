@@ -43,6 +43,7 @@ typedef struct {
     float volume;
     float filter_cutoff;     /* lowpass cutoff Hz, 20..20000           */
     float filter_resonance;  /* feedback resonance, 0..1               */
+    float vol_tracking;      /* 0=flat, 1=RMS-tracks input dynamics    */
 } Params;
 
 /* -------------------------------------------------------------------------
@@ -76,6 +77,7 @@ typedef struct {
     int       attack_blind_blocks; /* blocks to suppress pitch after gate open         */
     int       slur_change_count;   /* consecutive hops with >20% pitch jump            */
     int       pitch_stable_blocks; /* hops since last detected_hz commit               */
+    float     vol_rms_smooth;      /* 15ms smoothed RMS for volume tracking            */
     Capacitor filter;
 
     Params p;
@@ -111,6 +113,7 @@ static void params_init_defaults(Params *p) {
     p->volume           = 0.8f;
     p->filter_cutoff    = 20000.0f;
     p->filter_resonance = 0.3f;
+    p->vol_tracking     = 0.8f;
 }
 
 /* -------------------------------------------------------------------------
@@ -197,6 +200,7 @@ static void plugin_set_param(void *instance, const char *key, const char *val) {
         capacitor_set_cutoff(&s->filter, p->filter_cutoff, SAMPLE_RATE);
     }
     else if (strcmp(key, "filter_resonance") == 0) p->filter_resonance = parse_float(val, p->filter_resonance);
+    else if (strcmp(key, "vol_tracking")     == 0) p->vol_tracking     = parse_float(val, p->vol_tracking);
 }
 
 static int plugin_get_param(void *instance, const char *key, char *buf, int buf_len) {
@@ -214,6 +218,7 @@ static int plugin_get_param(void *instance, const char *key, char *buf, int buf_
     else if (strcmp(key, "volume")           == 0) return snprintf(buf, buf_len, "%.4f", p->volume);
     else if (strcmp(key, "filter_cutoff")    == 0) return snprintf(buf, buf_len, "%.2f", p->filter_cutoff);
     else if (strcmp(key, "filter_resonance") == 0) return snprintf(buf, buf_len, "%.4f", p->filter_resonance);
+    else if (strcmp(key, "vol_tracking")     == 0) return snprintf(buf, buf_len, "%.4f", p->vol_tracking);
     else if (strcmp(key, "detected_hz")      == 0) return snprintf(buf, buf_len, "%.2f", s->smoothed_hz);
     else if (strcmp(key, "gate")             == 0) return snprintf(buf, buf_len, "%d",   s->gate);
 
@@ -403,11 +408,13 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
                             s->slur_change_count = 0;
                         }
                     }
-                    /* Persistence filter: 2-of-3 readings within 15% required */
+                    /* Persistence filter: 2-of-3 readings within 15% required.
+                     * On commit snap smoothed_hz directly — no ramp across transitions. */
                     float candidate = persistence_filter(
                         s->raw_hz_buf, s->raw_hz_count, s->detected_hz);
                     if (candidate != s->detected_hz) {
                         s->detected_hz         = candidate;
+                        s->smoothed_hz         = candidate;
                         s->pitch_stable_blocks  = 0;
                     } else {
                         if (s->pitch_stable_blocks < 5) s->pitch_stable_blocks++;
@@ -419,6 +426,19 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
     }
     float rms = sqrtf(sum_sq / frames);
     s->last_rms = rms;
+
+    /* Volume tracking: smooth RMS at 15ms, apply power 1.5 curve.
+     * dyn_vol blends flat volume (vol_tracking=0) with RMS-tracked level
+     * (vol_tracking=1) so soft playing is quieter and loud is full volume.
+     * Reference level 0.10 RMS = forte — normalised to [0, 1]. */
+    {
+        float k_vol = 1.0f - expf(-(float)frames / (0.015f * SAMPLE_RATE));
+        s->vol_rms_smooth += k_vol * (rms - s->vol_rms_smooth);
+    }
+    float vol_norm = s->vol_rms_smooth / 0.10f;
+    if (vol_norm > 1.0f) vol_norm = 1.0f;
+    float dyn_vol = p->volume * (1.0f - p->vol_tracking
+                                + p->vol_tracking * powf(vol_norm, 1.5f));
 
     /* Decrement attack blind period counter once per block */
     if (s->attack_blind_blocks > 0) s->attack_blind_blocks--;
@@ -476,7 +496,7 @@ static void plugin_process_block(void *instance, int16_t *audio_inout, int frame
         }
 
         float freq     = s->smoothed_hz * powf(2.0f, p->osc_detune / 1200.0f);
-        float osc      = osc_tick(s, freq) * p->osc_level * p->volume;
+        float osc      = osc_tick(s, freq) * p->osc_level * dyn_vol;
         float filtered = capacitor_process(&s->filter, osc, p->filter_resonance);
 
         /* tanh soft limiter before int16 conversion — prevents clipping from
